@@ -1,0 +1,74 @@
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# Python and local environments
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+.test_clean_venv/
+.release_venv/
+.rrk_v1_3_venv/
+.rrk_v1_3_test_venv/
+.rrk_v1_3_runtime/
+
+# Test and tooling caches
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.audit_*/
+.presentation_build/
+tmp_pytest/
+.coverage
+.coverage.*
+htmlcov/
+.p0_*/
+.rrk_v1_3_*pytest*/
+
+# Local databases, SQLite sidecars, logs, and exports
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.bak
+*.log
+exports/
+live_test_*
+live_eval_*
+
+# Local AI/editor settings
+.claude/
+
+# Local marketing-production assets (not part of the distributable application)
+fonts/
+tools/
+video_assets/
+
+# Generated or restricted evaluation artifacts
+evaluation/**/__pycache__/
+evaluation/**/sealed/
+evaluation/**/predictions/
+evaluation/**/results/
+evaluation/**/data/blind_*
+evaluation/**/data/*ground_truth*
+evaluation/**/forensics/*ground_truth*
+evaluation/**/integrity_repair/
+evaluation/**/evidence_repair/
+evaluation/**/audits/
+evaluation/**/forensics/correction/
+evaluation/**/forensics/*.csv
+evaluation/**/forensics/*.json
+evaluation/**/retrieval_benchmark/*.csv

@@ -1,0 +1,26 @@
+[project]
+name = "wholesale-order-parser"
+version = "3.0.0"
+description = "Turn Egyptian-dialect WhatsApp wholesale orders into reviewed, approved picking notes"
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = ["evaluation", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "S"]
+ignore = ["S101", "E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B"]
+"tests/test_groq_reranker.py" = ["E402", "S", "B"]
+"tests/test_live_gemini.py" = ["E402", "S", "B"]
+"tests/test_reranker_benchmark.py" = ["E402", "S", "B"]

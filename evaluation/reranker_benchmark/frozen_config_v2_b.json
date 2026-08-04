@@ -1,0 +1,17 @@
+{
+  "model_id": "RR-K-v2-B",
+  "provider": "groq",
+  "underlying_model": "openai/gpt-oss-120b",
+  "reasoning_effort": "low",
+  "prompt_file": "evaluation/reranker_benchmark/groq_prompt_v2.txt",
+  "prompt_sha256": "f0daf84778ce23e00cb06e9053d60f467fa7884952214d4b648b9a8447d7c75d",
+  "calibrated_thresholds": {
+    "acceptance_threshold": 0.85,
+    "review_threshold": 0.4,
+    "out_of_catalog_rejection_threshold": 0.2,
+    "score_margin_threshold": 0.15
+  },
+  "guards": "Deterministic Python-side contradiction guards (Brand, Volume, Weight, Dimensions, Color, Pack Count)",
+  "prediction_file": "evaluation/reranker_benchmark/predictions/rr_k_v2_b_dev_predictions.jsonl",
+  "prediction_sha256": "cc92c16d2066cdaf4c16a2e341f4feaff4c9bb2d8a7d8d3086a88d4c2a639ccf"
+}

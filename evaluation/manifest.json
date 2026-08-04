@@ -1,0 +1,24 @@
+{
+  "random_seed": 42,
+  "git": {
+    "git_available": false,
+    "commit_hash": null,
+    "working_tree_clean": null
+  },
+  "file_hashes": {
+    "app/catalog.py": "6723738e97b0aeb9316b4e66fcb38f3069bfcbabb69becb07324913524443e92",
+    "app/database.py": "b69d817fb6b59554dd0fc56b30ad43966b1a5d204f2491cf7cc8f5a57710141d",
+    "app/extractor.py": "d0b7f5d404d52b679c86adc47dd14639c785b4623da0279d35d894e55482f57a",
+    "app/main.py": "881b4cb4a7814aefaeb33595ca58ccee1dc3008c839c314dd10dc773d9eec921",
+    "app/matcher.py": "35709cd48f65bb46fbb2b3e17d32dcc313c34fcdd5ef7c280d79688bfcda7a44",
+    "app/models.py": "c626ed3d81ffa5c0fc857f6e6eaf63b3f50c36008b56ffa21f180cc2666265a0",
+    "app/normalizer.py": "effb7845e25f1e10d7da8ff48f82e08a32dfbaad0015b0e2b0f8e72d063f4943",
+    "evaluation/data/synthetic_catalog_400.csv": "61d7f39fd0ccd25cbd6f82f526d2902569b0fde16fac5ae008dae9e4cc373ec4",
+    "evaluation/data/blind_orders.jsonl": "0d7080cd38eb15f42dc9fe169204e1b18fc36b9fc94f3ab772330c8af06f1f8f",
+    "evaluation/sealed/blind_ground_truth.jsonl": "e099d45b9bdf3709fc360ba3f62b77849ab04c144a0e1fbfac2bbec07aaad647",
+    "evaluation/unit_normalization_map.json": "8068244f4981bfa9432af14e5a782a85759ce31417292735bc7048a1c3a75daa"
+  },
+  "catalog_size": 400,
+  "blind_order_count": 100,
+  "prediction_file_hash": "58d170442336feb2dca024edb634f17cd1e78eff25b7870d7272b5d4ae7a3a03"
+}

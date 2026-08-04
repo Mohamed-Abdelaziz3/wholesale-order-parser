@@ -1,0 +1,37 @@
+{
+  "file_hashes": {
+    "evaluation/retrieval_benchmark/benchmark_manifest.json": "f5c92fce2c731e8f447546c179f4a057ca38dc7f7fdf7dee8ed372a826d0ab05",
+    "evaluation/retrieval_benchmark/split_manifest.json": "69ed638f1f5fd297cfa284fd508af95e88e04bfee024f5e9e6af3e4d5ae9a564",
+    "evaluation/retrieval_benchmark/frozen_config.json": "MISSING",
+    "evaluation/retrieval_benchmark/benchmark_queries.jsonl": "5fcba52e47925f28efb45b161eb5758656f320069e429bcbc4467ef2f4a29d5a",
+    "evaluation/retrieval_benchmark/query_results.csv": "a312c18a60b45a3fb20ee1fe09f8d61f0627bb550f2f59bfc171ada29f9effce",
+    "evaluation/retrieval_benchmark/method_metrics.csv": "589e9a4c5f00e3860397bbe032ab3807e089b607eaa027a6422db9f663e4ef93",
+    "evaluation/retrieval_benchmark/RETRIEVAL_BENCHMARK_REPORT.md": "9df464fcfc58f947d56b24ca4e8f1186596658f7192f526bdaef533af82e1b30",
+    "evaluation/results/blind_predictions.jsonl": "58d170442336feb2dca024edb634f17cd1e78eff25b7870d7272b5d4ae7a3a03",
+    "evaluation/sealed/blind_ground_truth.jsonl": "e099d45b9bdf3709fc360ba3f62b77849ab04c144a0e1fbfac2bbec07aaad647",
+    "evaluation/data/synthetic_catalog_400.csv": "61d7f39fd0ccd25cbd6f82f526d2902569b0fde16fac5ae008dae9e4cc373ec4"
+  },
+  "git_info": {
+    "error": "Command '['git', 'rev-parse', 'HEAD']' returned non-zero exit status 128.",
+    "commit": null,
+    "clean": null
+  },
+  "system_info": {
+    "python_version": "3.12.10 (tags/v3.12.10:0cc8128, Apr  8 2025, 12:21:36) [MSC v.1943 64 bit (AMD64)]",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "AMD64 Family 25 Model 68 Stepping 1, AuthenticAMD",
+    "cpu_count": 8,
+    "total_ram_gb": 11.69,
+    "avail_ram_gb": 2.73
+  },
+  "package_versions": {
+    "torch": "2.13.0+cpu",
+    "transformers": "5.14.1",
+    "sentence-transformers": "5.6.1",
+    "scikit-learn": "NOT INSTALLED (No module named 'scikit_learn')",
+    "numpy": "2.5.1",
+    "rapidfuzz": "3.14.5",
+    "google-generativeai": "NOT INSTALLED (No module named 'google_generativeai')",
+    "pydantic": "2.13.4"
+  }
+}

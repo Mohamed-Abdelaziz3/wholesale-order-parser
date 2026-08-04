@@ -1,0 +1,60 @@
+{
+  "method_id": "RR-K",
+  "provider_name": "Groq",
+  "requested_model_id": "openai/gpt-oss-120b",
+  "actual_model_id_returned": "openai/gpt-oss-120b",
+  "calibration_timestamp": "2026-07-25T11:04:15Z",
+  "prompt_template_file": "evaluation/reranker_benchmark/groq_prompt.txt",
+  "prompt_template_sha256": "59a8670ab4e12cd775d95ecbb4a7fc6474b492096e3a40d172c247f8741e8af5",
+  "prompt_wording": "You are an expert wholesale food and beverage distribution catalog matcher in Egypt.\nYour task is to select the single best matching product from a provided list of Top-5 candidate products for a customer order line item, or decide if manual review or rejection is required.\n\n=== ORDER LINE ITEM ===\nExtracted Product Mention: {{extracted_product}}\nExtracted Quantity: {{extracted_quantity}}\nExtracted Unit: {{extracted_unit}}\nContext: {{context}}\n\n=== TOP-5 CANDIDATE PRODUCTS ===\n{{candidates_list}}\n\n=== MATCHING RULES & RULES OF ENGAGEMENT ===\n1. SEMANTIC IDENTITY: You must evaluate true semantic identity (exact item, brand, variant, weight/volume, pack count), NOT general topical similarity.\n2. PRIORITIZE EXACT MATCH: Give highest priority to candidate products that match the exact requested brand, product name, size, unit, package type, flavor, concentration, count, and variant.\n3. EGYPTIAN WHOLESALE CONTEXT: Handle Egyptian colloquial Arabic, Arabic spelling variations, Arabizi, English terms, commercial abbreviations, spacing errors, and common Egyptian wholesale shorthand (e.g., كرتونة, باكو, رول, شرink, دستة, صفيحة, بستلة, جرام, كيلو, لتر, ملي).\n4. DO NOT INVENT ATTRIBUTES: Rely strictly on the evidence present in the extracted mention and candidates. Do not assume or invent missing attributes (such as assuming a default flavor or pack size if unstated and multiple variations exist in candidates).\n5. AMBIGUITY (REVIEW): If multiple candidate products could reasonably match and the provided evidence does not safely and unambiguously distinguish between them, you MUST select \"REVIEW\".\n6. NO MATCH (NOT_FOUND): If none of the supplied candidate products reasonably satisfies the customer request (or if the item is clearly out of catalog), you MUST select \"NOT_FOUND\".\n7. STRICT CANDIDATE BOUNDARY: You MUST select either one of the exact candidate product codes provided above, \"REVIEW\", or \"NOT_FOUND\". Never invent or output any product code outside the supplied candidates.\n\n=== OUTPUT SCHEMA ===\nYou must output a structured JSON response matching the required schema with keys:\n- selected_code: The exact product code from candidates, \"REVIEW\", or \"NOT_FOUND\".\n- confidence: A finite number between 0.0 and 1.0 reflecting confidence in the decision.\n- reason_code: One of the controlled reason codes: EXACT_MATCH, HIGH_CONFIDENCE_MATCH, PARTIAL_MATCH, AMBIGUOUS_CANDIDATES, MISSING_ATTRIBUTES, NO_MATCHING_CANDIDATE, OUT_OF_CATALOG, PRICE_OR_PACK_MISMATCH.",
+  "structured_output_schema": {
+    "type": "json_schema",
+    "name": "RerankDecision",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "selected_code": {
+          "type": "string",
+          "description": "Must be dynamically restricted per case to candidate product IDs + ['REVIEW', 'NOT_FOUND']"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0.0,
+          "maximum": 1.0
+        },
+        "reason_code": {
+          "type": "string",
+          "enum": [
+            "EXACT_MATCH",
+            "HIGH_CONFIDENCE_MATCH",
+            "PARTIAL_MATCH",
+            "AMBIGUOUS_CANDIDATES",
+            "MISSING_ATTRIBUTES",
+            "NO_MATCHING_CANDIDATE",
+            "OUT_OF_CATALOG",
+            "PRICE_OR_PACK_MISMATCH"
+          ]
+        }
+      },
+      "required": ["selected_code", "confidence", "reason_code"],
+      "additionalProperties": false
+    }
+  },
+  "schema_definition_sha256": "997c2107e42ed497595dc4f0d31841162b71d001ac7a33de0a16080e83e75f45",
+  "reasoning_effort_setting": "default (automatic reasoning tokens enabled by Groq API for openai/gpt-oss-120b)",
+  "confidence_calibration_rules": {
+    "acceptance_threshold": 0.85,
+    "review_threshold": 0.40,
+    "interpretation": "If decision == SELECT and confidence >= 0.85, Auto-Accept. If decision == REVIEW or confidence < 0.85, route to Human Review / Safe Handling. If decision == NOT_FOUND, route to Out of Catalog Rejection."
+  },
+  "acceptance_threshold": 0.85,
+  "review_threshold": 0.40,
+  "not_found_policy": "When none of the 5 candidate products match the item (or item is clearly out of catalog), select NOT_FOUND and map selected_code to None for downstream scoring.",
+  "retry_policy": {
+    "max_retries": 5,
+    "base_delay_seconds": 1.0,
+    "rate_limit_handling": "Exponential backoff with jitter and respect for Retry-After headers on HTTP 429.",
+    "fuzzy_matching_repair": "PROHIBITED"
+  },
+  "status": "FROZEN_FOR_USER_APPROVAL"
+}

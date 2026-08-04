@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ document_title }} رقم {{ order_id }} — {{ shop.name }}</title>
+<!--
+  Self-contained by design. No stylesheet, font, image or script is fetched at
+  load time: the merchant downloads this file to a phone and opens it with the
+  network off. The logo, if any, is embedded as a data: URL. The only external
+  resource in the file is the image library, and it is fetched lazily on an
+  explicit click — never during rendering — so the document is complete offline.
+-->
+<style>
+  /* System fonts only. A webfont would be an external request and would leave
+     the document blank-ish offline; every platform the merchant uses ships a
+     usable Arabic face. */
+  :root{
+    --ink:#111;--muted:#555;--line:#c9c9c9;--head:#f2f2f2;--warn:#8a5a00;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{
+    font-family:"Segoe UI","Tahoma","Arial","Noto Naskh Arabic","Amiri",
+                "Geeza Pro","Droid Arabic Naskh",sans-serif;
+    background:#e9e9ee;color:var(--ink);line-height:1.6;padding:16px;
+    -webkit-print-color-adjust:exact;print-color-adjust:exact;
+  }
+  .paper{
+    width:210mm;max-width:100%;margin:0 auto;background:#fff;
+    padding:14mm 12mm;box-shadow:0 2px 14px rgba(0,0,0,.18);
+  }
+  /* The whole document is one table so that the shop header (thead) and the
+     legal footer (tfoot) are repeated by the browser on every printed page.
+     This is the only mechanism that works reliably across browsers. */
+  table.sheet{width:100%;border-collapse:collapse}
+  table.sheet > thead > tr > td,
+  table.sheet > tbody > tr > td,
+  table.sheet > tfoot > tr > td{padding:0}
+  table.sheet > thead{display:table-header-group}
+  table.sheet > tfoot{display:table-footer-group}
+
+  .shop{
+    display:flex;gap:14px;align-items:flex-start;
+    border-bottom:2px solid var(--ink);padding-bottom:10px;margin-bottom:12px;
+  }
+  .shop .logo{max-height:70px;max-width:120px;object-fit:contain;flex:0 0 auto}
+  .shop .who{flex:1 1 auto;min-width:0}
+  .shop .who h1{font-size:1.35rem;font-weight:700;line-height:1.3;word-wrap:break-word}
+  .shop .who div{font-size:.82rem;color:var(--muted)}
+  .shop .meta{flex:0 0 auto;text-align:left;font-size:.86rem}
+  .shop .meta .t{font-size:1.05rem;font-weight:700;color:var(--ink);margin-bottom:3px}
+  .shop .meta .r{color:var(--muted)}
+
+  .party{
+    border:1px solid var(--line);border-radius:4px;padding:9px 11px;
+    margin-bottom:12px;font-size:.86rem;
+  }
+  .party .row{display:flex;flex-wrap:wrap;gap:18px;margin-bottom:5px}
+  .party .row:last-child{margin-bottom:0}
+  .party .f{flex:1 1 220px;white-space:nowrap;overflow:hidden}
+  .party .lbl{color:var(--muted)}
+  .fill{display:inline-block;min-width:120px;border-bottom:1px dotted #888;height:1em}
+
+  table.items{width:100%;border-collapse:collapse;font-size:.85rem;margin-bottom:0}
+  table.items thead{display:table-header-group;background:var(--head)}
+  table.items th,table.items td{
+    border:1px solid var(--line);padding:6px 7px;text-align:right;vertical-align:top;
+  }
+  table.items th{font-weight:700;font-size:.8rem;white-space:nowrap}
+  table.items tr{page-break-inside:avoid;break-inside:avoid}
+  table.items td.n,table.items th.n{text-align:center;white-space:nowrap}
+  table.items td.m,table.items th.m{text-align:left;white-space:nowrap;font-variant-numeric:tabular-nums}
+  table.items td.code{white-space:nowrap;font-size:.8rem;color:var(--muted)}
+
+  .totals{display:flex;justify-content:flex-start;margin-top:10px}
+  .totals table{border-collapse:collapse;font-size:.88rem;min-width:270px;margin-inline-start:auto}
+  .totals td{padding:5px 10px;border:1px solid var(--line)}
+  .totals td.k{color:var(--muted)}
+  .totals td.v{text-align:left;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .totals tr.grand td{font-weight:700;font-size:1rem;background:var(--head);color:var(--ink)}
+
+  .signatures{
+    display:flex;gap:26px;margin-top:22px;padding-top:10px;font-size:.86rem;
+    page-break-inside:avoid;break-inside:avoid;
+  }
+  .signatures div{flex:1 1 0}
+  .signatures .line{
+    display:block;border-bottom:1px solid var(--ink);height:26px;margin-top:4px;
+  }
+
+  .override-price{display:block;margin-top:2px;font-size:.68rem;color:var(--warn);font-weight:600}
+  .shopnote{
+    margin-top:14px;font-size:.8rem;color:var(--muted);
+    border-top:1px solid var(--line);padding-top:7px;word-wrap:break-word;
+  }
+  .legal{
+    margin-top:10px;padding-top:8px;border-top:2px solid var(--ink);
+    font-size:.76rem;color:var(--ink);font-weight:600;line-height:1.7;
+  }
+
+  .toolbar{
+    width:210mm;max-width:100%;margin:0 auto 12px;display:flex;gap:9px;
+    flex-wrap:wrap;align-items:center;
+  }
+  .toolbar button{
+    font-family:inherit;font-size:.85rem;font-weight:700;padding:9px 16px;
+    border:1px solid #2f3b52;background:#2f3b52;color:#fff;border-radius:7px;cursor:pointer;
+  }
+  .toolbar button:disabled{opacity:.55;cursor:progress}
+  .toolbar .msg{font-size:.8rem;color:#444}
+
+  @page{size:A4;margin:12mm}
+  @media print{
+    body{background:#fff;padding:0}
+    .paper{width:auto;box-shadow:none;padding:0;margin:0}
+    .toolbar,.noprint{display:none!important}
+    .signatures{page-break-inside:avoid}
+  }
+</style>
+</head>
+<body>
+
+<div class="toolbar noprint">
+  <button type="button" id="pngBtn">تحميل كصورة (PNG)</button>
+  <span class="msg" id="pngMsg"></span>
+</div>
+
+<div class="paper" id="paper">
+<table class="sheet">
+  <thead>
+    <tr><td>
+      <div class="shop">
+        {% if shop.logo_data_url %}
+        <img class="logo" src="{{ shop.logo_data_url }}" alt="">
+        {% endif %}
+        <div class="who">
+          <h1>{{ shop.name }}</h1>
+          {% if shop.address %}<div>{{ shop.address }}</div>{% endif %}
+          {% if shop.phone %}<div>{{ shop.phone }}</div>{% endif %}
+          {% if shop.tax_id %}<div>الكود الضريبي: {{ shop.tax_id }}</div>{% endif %}
+        </div>
+        <div class="meta">
+          <div class="t">{{ document_title }} رقم: {{ order_id }}</div>
+          <div class="r">التاريخ: {{ date }}</div>
+        </div>
+      </div>
+    </td></tr>
+  </thead>
+
+  <tfoot>
+    <tr><td>
+      <div class="legal">{{ legal_footer }}</div>
+    </td></tr>
+  </tfoot>
+
+  <tbody>
+    <tr><td>
+
+      <div class="party">
+        <div class="row">
+          <div class="f"><span class="lbl">العميل:</span> {% if customer.name %}{{ customer.name }}{% else %}<span class="fill"></span>{% endif %}</div>
+          <div class="f"><span class="lbl">التليفون:</span> {% if customer.phone %}{{ customer.phone }}{% else %}<span class="fill"></span>{% endif %}</div>
+        </div>
+        <div class="row">
+          <div class="f" style="flex:1 1 100%"><span class="lbl">العنوان:</span> {% if customer.address %}{{ customer.address }}{% else %}<span class="fill" style="min-width:70%"></span>{% endif %}</div>
+        </div>
+      </div>
+
+      <table class="items">
+        <thead>
+          <tr>
+            <th class="n">#</th>
+            <th>الكود</th>
+            <th>الصنف</th>
+            <th class="n">الوحدة</th>
+            <th class="n">الكمية</th>
+            <th class="m">السعر</th>
+            <th class="m">الإجمالي</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for line in lines %}
+          <tr>
+            <td class="n">{{ line.index }}</td>
+            <td class="code">{{ line.product_id }}</td>
+            <td>{{ line.product_name }}</td>
+            <td class="n">{{ line.unit }}</td>
+            <td class="n">{{ line.quantity }}</td>
+            <td class="m">{{ line.price }}{% if line.price_overridden %}<span class="override-price">سعر خاص{% if line.catalog_price %} (سعر الكتالوج: {{ line.catalog_price }}){% endif %}</span>{% endif %}</td>
+            <td class="m">{{ line.line_total }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+
+      <div class="totals">
+        <table>
+          <tr>
+            <td class="k">الإجمالي قبل الخصم</td>
+            <td class="v">{{ subtotal }} {{ currency }}</td>
+          </tr>
+          <tr>
+            <td class="k">الخصم</td>
+            <td class="v">{{ discount }} {{ currency }}</td>
+          </tr>
+          <tr class="grand">
+            <td class="k">الإجمالي النهائي</td>
+            <td class="v">{{ grand_total }} {{ currency }}</td>
+          </tr>
+        </table>
+      </div>
+
+      <div class="signatures">
+        <div>أمين المخزن: <span class="line"></span></div>
+        <div>المستلم: <span class="line"></span></div>
+      </div>
+
+      {% if shop.footer_note %}
+      <div class="shopnote">{{ shop.footer_note }}</div>
+      {% endif %}
+
+    </td></tr>
+  </tbody>
+</table>
+</div>
+
+<script>
+"use strict";
+/* The PNG button is the only thing in this file that touches the network, and
+   only when the merchant clicks it — WhatsApp takes images, not HTML files.
+   The library is pinned by Subresource Integrity, so a compromised CDN cannot
+   swap in different code and read the customer's order. With no connection the
+   load simply fails and the document itself is unaffected. */
+var H2C_URL = "https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js";
+var H2C_SRI = "sha384-ZZ1pncU3bQe8y31yfZdMFdSpttDoPmOZg2wguVK9almUodir1PghgT0eY7Mrty8H";
+
+function loadLibrary() {
+  if (window.html2canvas) return Promise.resolve(window.html2canvas);
+  return new Promise(function (resolve, reject) {
+    var tag = document.createElement("script");
+    tag.src = H2C_URL;
+    tag.integrity = H2C_SRI;
+    tag.crossOrigin = "anonymous";
+    tag.referrerPolicy = "no-referrer";
+    tag.onload = function () {
+      window.html2canvas ? resolve(window.html2canvas) : reject(new Error("missing"));
+    };
+    tag.onerror = function () { reject(new Error("offline")); };
+    document.head.appendChild(tag);
+  });
+}
+
+function exportPng() {
+  var button = document.getElementById("pngBtn");
+  var message = document.getElementById("pngMsg");
+  button.disabled = true;
+  message.textContent = "جارٍ تجهيز الصورة…";
+
+  loadLibrary().then(function (html2canvas) {
+    return html2canvas(document.getElementById("paper"), {
+      backgroundColor: "#ffffff",
+      scale: 2,
+      useCORS: false,
+    });
+  }).then(function (canvas) {
+    var link = document.createElement("a");
+    link.download = "order-{{ order_id }}.png";
+    link.href = canvas.toDataURL("image/png");
+    link.click();
+    message.textContent = "تم تحميل الصورة.";
+  }).catch(function () {
+    message.textContent =
+      "تعذّر تحويل المستند لصورة (محتاج إنترنت أول مرة). " +
+      "تقدر تاخد لقطة شاشة، أو تطبع الملف وتحفظه PDF.";
+  }).then(function () {
+    button.disabled = false;
+  });
+}
+
+document.getElementById("pngBtn").addEventListener("click", exportPng);
+
+// Opened as ".../document?inline=1#png" from the app's «تحميل كصورة» button,
+// so that reaching a WhatsApp-ready image is one click rather than three.
+if (window.location.hash === "#png") {
+  window.addEventListener("load", exportPng);
+}
+</script>
+</body>
+</html>
