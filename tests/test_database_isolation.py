@@ -11,7 +11,9 @@ from app.catalog import load_catalog
 from app.main import create_app
 
 
-def _fingerprint(path: Path) -> tuple[str, int]:
+def _fingerprint(path: Path) -> tuple[str, int] | None:
+    if not path.is_file():
+        return None
     return hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_size
 
 
