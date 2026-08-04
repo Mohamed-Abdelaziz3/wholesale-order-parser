@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>تسجيل الدخول | {{ app_title }}</title>
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg-primary:#0a0e1a; --bg-card:rgba(17,24,39,.78); --border-glass:rgba(255,255,255,.08);
+  --text-primary:#f0f4ff; --text-secondary:#8b95b0; --accent:#6366f1; --accent-light:#818cf8;
+  --danger:#ef4444; --danger-bg:rgba(239,68,68,.12); --radius:16px;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Cairo',sans-serif;background:var(--bg-primary);color:var(--text-primary);
+  min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
+body::before{content:'';position:fixed;inset:-50%;
+  background:radial-gradient(circle at 30% 50%,rgba(99,102,241,.10) 0%,transparent 50%),
+             radial-gradient(circle at 70% 20%,rgba(168,85,247,.07) 0%,transparent 40%);z-index:-1}
+.box{width:100%;max-width:420px;background:var(--bg-card);backdrop-filter:blur(20px);
+  border:1px solid var(--border-glass);border-radius:var(--radius);padding:36px 32px;
+  box-shadow:0 8px 32px rgba(0,0,0,.4)}
+h1{font-size:1.6rem;font-weight:900;text-align:center;margin-bottom:6px;
+  background:linear-gradient(135deg,var(--accent-light),#c084fc);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.sub{text-align:center;color:var(--text-secondary);font-size:.9rem;margin-bottom:28px}
+label{display:block;font-size:.85rem;font-weight:600;margin-bottom:8px;color:var(--text-secondary)}
+input{width:100%;padding:13px 16px;background:rgba(255,255,255,.04);
+  border:1px solid var(--border-glass);border-radius:10px;color:var(--text-primary);
+  font-family:inherit;font-size:.95rem;margin-bottom:18px;transition:border-color .2s}
+input:focus{outline:none;border-color:var(--accent)}
+button{width:100%;padding:13px;border:none;border-radius:10px;cursor:pointer;
+  font-family:inherit;font-size:.95rem;font-weight:700;color:#fff;
+  background:linear-gradient(135deg,var(--accent),#8b5cf6);transition:transform .15s,opacity .15s}
+button:hover:not(:disabled){transform:translateY(-1px)}
+button:disabled{opacity:.55;cursor:not-allowed}
+.error{display:none;background:var(--danger-bg);border:1px solid rgba(239,68,68,.25);
+  color:#fca5a5;border-radius:10px;padding:11px 14px;font-size:.85rem;margin-bottom:18px}
+.error.show{display:block}
+.note{margin-top:22px;font-size:.75rem;color:#5a6380;text-align:center;line-height:1.7}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>{{ app_title }}</h1>
+  <p class="sub">تسجيل دخول المراجع</p>
+
+  <div class="error" id="err"></div>
+
+  <form id="loginForm" autocomplete="on">
+    <label for="operator">اسم المراجع</label>
+    <input type="text" id="operator" name="username" autocomplete="username"
+           placeholder="مثال: ahmed" required autofocus>
+
+    <label for="password">كلمة المرور</label>
+    <input type="password" id="password" name="password" autocomplete="current-password" required>
+
+    <button type="submit" id="submitBtn">دخول</button>
+  </form>
+
+  <p class="note">
+    كل قرار مراجعة أو اعتماد يُسجَّل باسم الحساب اللي داخل بيه.<br>
+    مينفعش تسجّل قرار باسم شخص تاني.
+  </p>
+</div>
+
+<script>
+const form = document.getElementById('loginForm');
+const errBox = document.getElementById('err');
+const btn = document.getElementById('submitBtn');
+
+function showError(message) {
+  errBox.textContent = message;
+  errBox.classList.add('show');
+}
+
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  errBox.classList.remove('show');
+  btn.disabled = true;
+  btn.textContent = 'جارٍ الدخول...';
+  try {
+    const response = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        operator: document.getElementById('operator').value,
+        password: document.getElementById('password').value,
+      }),
+    });
+    if (response.ok) {
+      window.location.href = '/';
+      return;
+    }
+    const data = await response.json().catch(() => ({}));
+    showError(data.detail || 'تعذّر تسجيل الدخول.');
+  } catch (error) {
+    showError('تعذّر الاتصال بالخادم.');
+  }
+  btn.disabled = false;
+  btn.textContent = 'دخول';
+});
+</script>
+</body>
+</html>

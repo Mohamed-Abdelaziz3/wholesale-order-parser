@@ -1,0 +1,30 @@
+{
+  "calibration_timestamp": "2026-07-25T09:17:19Z",
+  "selected_local_model": "RR-C",
+  "selected_api_model": "gemini-3.5-flash",
+  "selected_query_representation": "mention_qty",
+  "fusion_weights": {
+    "retrieval_weight": 0.4,
+    "local_weight": 0.6,
+    "normalization": "min_max"
+  },
+  "calibrated_thresholds": {
+    "acceptance_threshold": 0.85,
+    "review_threshold": 0.4,
+    "out_of_catalog_rejection_threshold": 0.2,
+    "score_margin_threshold": 0.15
+  },
+  "cascade_rules": {
+    "RR-I_cost_aware_cascade": {
+      "tier_1_local": "RR-C",
+      "tier_2_api": "RR-G (Gemini)",
+      "routing_rule": "If local_top_1_score >= 0.85 and margin >= 0.15 -> Auto-Accept. Else route to Gemini."
+    },
+    "RR-J_local_only_safe_cascade": {
+      "tier_1_local": "RR-C",
+      "tier_2_fallback": "Human Review / Rejection",
+      "routing_rule": "If local_top_1_score >= 0.85 -> Auto-Accept. If 0.40 <= score < 0.85 -> Human Review. If < 0.40 -> Reject."
+    }
+  },
+  "status": "FROZEN_FOR_EVALUATION"
+}

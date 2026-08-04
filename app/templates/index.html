@@ -1,0 +1,1638 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ app_title }} | Wholesale Order Parser</title>
+<meta name="description" content="تحويل طلبات الواتساب المكتوبة بالعامية المصرية إلى طلبات مراجَعة ومعتمدة">
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;900&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg-primary:#0a0e1a;--bg-card:rgba(17,24,39,.75);--bg-glass:rgba(255,255,255,.04);
+  --border-glass:rgba(255,255,255,.08);--text-primary:#f0f4ff;--text-secondary:#8b95b0;
+  --text-muted:#5a6380;--accent:#6366f1;--accent-light:#818cf8;
+  --success:#10b981;--success-bg:rgba(16,185,129,.12);
+  --warning:#f59e0b;--warning-bg:rgba(245,158,11,.12);
+  --danger:#ef4444;--danger-bg:rgba(239,68,68,.12);
+  --info:#3b82f6;--info-bg:rgba(59,130,246,.12);
+  --approved:#a855f7;--approved-bg:rgba(168,85,247,.15);
+  --radius:16px;--radius-sm:10px;--shadow:0 8px 32px rgba(0,0,0,.35);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Cairo',sans-serif;background:var(--bg-primary);color:var(--text-primary);min-height:100vh;overflow-x:hidden}
+body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%;
+  background:radial-gradient(circle at 30% 50%,rgba(99,102,241,.08) 0%,transparent 50%),
+             radial-gradient(circle at 70% 20%,rgba(168,85,247,.06) 0%,transparent 40%),
+             radial-gradient(circle at 50% 80%,rgba(59,130,246,.05) 0%,transparent 45%);z-index:-1}
+.container{max-width:1180px;margin:0 auto;padding:32px 22px 60px}
+.topbar{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:26px}
+.brand h1{font-size:1.85rem;font-weight:900;
+  background:linear-gradient(135deg,var(--accent-light),#a78bfa,#c084fc);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.brand p{color:var(--text-secondary);font-size:.88rem;margin-top:2px}
+.topbar-right{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:7px;padding:6px 14px;border-radius:999px;
+  font-size:.78rem;font-weight:600;background:var(--bg-glass);border:1px solid var(--border-glass);color:var(--text-secondary)}
+.chip.ok{background:var(--success-bg);color:var(--success);border-color:rgba(16,185,129,.2)}
+.chip.warn{background:var(--warning-bg);color:var(--warning);border-color:rgba(245,158,11,.2)}
+.card{background:var(--bg-card);backdrop-filter:blur(20px);border:1px solid var(--border-glass);
+  border-radius:var(--radius);padding:24px;margin-bottom:20px;box-shadow:var(--shadow)}
+.card-title{display:flex;align-items:center;gap:10px;font-size:1.06rem;font-weight:700;margin-bottom:16px;flex-wrap:wrap}
+.card-title .sp{margin-inline-start:auto;font-size:.78rem;font-weight:600;color:var(--text-muted)}
+textarea{width:100%;min-height:118px;padding:15px;background:rgba(255,255,255,.04);
+  border:1px solid var(--border-glass);border-radius:var(--radius-sm);color:var(--text-primary);
+  font-family:inherit;font-size:1rem;resize:vertical;line-height:1.7}
+textarea:focus{outline:none;border-color:var(--accent)}
+.samples{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+.sample{padding:6px 12px;background:var(--bg-glass);border:1px solid var(--border-glass);
+  border-radius:999px;font-size:.75rem;color:var(--text-secondary);cursor:pointer;font-family:inherit}
+.sample:hover{border-color:var(--accent);color:var(--text-primary)}
+.row-actions{display:flex;gap:10px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap}
+.btn{padding:11px 20px;border:none;border-radius:var(--radius-sm);cursor:pointer;font-family:inherit;
+  font-size:.88rem;font-weight:700;display:inline-flex;align-items:center;gap:8px;transition:transform .15s,opacity .15s}
+.btn:hover:not(:disabled){transform:translateY(-1px)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn-primary{background:linear-gradient(135deg,var(--accent),#8b5cf6);color:#fff}
+.btn-success{background:linear-gradient(135deg,var(--success),#059669);color:#fff}
+.btn-secondary{background:var(--bg-glass);border:1px solid var(--border-glass);color:var(--text-secondary)}
+.btn-sm{padding:6px 11px;font-size:.74rem;border-radius:8px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+.stat{background:var(--bg-card);border:1px solid var(--border-glass);border-radius:var(--radius-sm);padding:16px;text-align:center}
+.stat-value{font-size:1.65rem;font-weight:900}
+.stat-label{font-size:.76rem;color:var(--text-secondary);margin-top:2px}
+.banner{border-radius:var(--radius-sm);padding:13px 17px;margin-bottom:18px;font-size:.88rem;font-weight:600;
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.banner.info{background:var(--info-bg);color:#93c5fd;border:1px solid rgba(59,130,246,.22)}
+.banner.warn{background:var(--warning-bg);color:#fcd34d;border:1px solid rgba(245,158,11,.22)}
+.banner.ok{background:var(--success-bg);color:#6ee7b7;border:1px solid rgba(16,185,129,.22)}
+.banner.err{background:var(--danger-bg);color:#fca5a5;border:1px solid rgba(239,68,68,.22)}
+.table-wrap{overflow-x:auto;border-radius:var(--radius-sm);border:1px solid var(--border-glass)}
+table{width:100%;border-collapse:collapse;font-size:.85rem;min-width:960px}
+thead{background:rgba(99,102,241,.12)}
+th{padding:12px 10px;text-align:right;font-weight:700;font-size:.78rem;color:var(--accent-light);white-space:nowrap}
+td{padding:11px 10px;border-top:1px solid var(--border-glass);vertical-align:top}
+  tr.confirmed{background:rgba(16,185,129,.05)}
+  tr.excluded{background:rgba(245,158,11,.05)}
+  tr.cancelled{background:rgba(239,68,68,.05)}
+  select,input[type=number],input[type=text],input[type=search]{padding:7px 9px;background:rgba(255,255,255,.05);
+  border:1px solid var(--border-glass);border-radius:8px;color:var(--text-primary);font-family:inherit;font-size:.8rem;max-width:100%}
+select:focus,input:focus{outline:none;border-color:var(--accent)}
+select{min-width:240px}
+.badge{display:inline-block;padding:3px 9px;border-radius:999px;font-size:.7rem;font-weight:700;white-space:nowrap}
+.badge.pending{background:var(--warning-bg);color:var(--warning)}
+.badge.done{background:var(--success-bg);color:var(--success)}
+  .badge.gone{background:var(--danger-bg);color:#fca5a5}
+  .badge.cancelled{background:var(--danger-bg);color:#fca5a5}
+.badge.appr{background:var(--approved-bg);color:#c084fc}
+.hint{font-size:.72rem;color:var(--text-muted);margin-bottom:5px;line-height:1.7}
+.hint strong{color:var(--accent-light)}
+.timecard{background:linear-gradient(135deg,rgba(99,102,241,.10),rgba(168,85,247,.06));
+  border:1px solid rgba(99,102,241,.2);border-radius:var(--radius-sm);padding:15px 18px;margin-top:16px}
+.timecard .t{font-weight:700;margin-bottom:5px}
+.timecard .d{font-size:.78rem;color:var(--text-secondary);line-height:1.8}
+.timecard .m{font-size:.7rem;color:var(--text-muted);margin-top:7px}
+.identity{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end;
+  font-size:.78rem;color:var(--text-secondary);margin-top:14px}
+.identity code{background:var(--bg-glass);padding:3px 9px;border-radius:6px;color:var(--accent-light);font-weight:700}
+.hidden{display:none!important}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+.settings-grid label{display:flex;flex-direction:column;gap:5px;font-size:.78rem;color:var(--text-secondary);font-weight:600}
+.settings-grid input{width:100%}
+.logo-preview{max-height:64px;max-width:150px;object-fit:contain;background:#fff;
+  border-radius:8px;padding:5px;border:1px solid var(--border-glass)}
+/* Price columns are removed from the DOM, not merely hidden, when the catalog
+   carries no prices: a column of 0.00 reads as "everything is free". */
+#reviewTable.no-prices .col-price{display:none}
+.money{font-variant-numeric:tabular-nums;white-space:nowrap}
+.ordertotal{display:flex;align-items:baseline;justify-content:flex-end;gap:12px;flex-wrap:wrap;
+  margin-top:14px;padding:13px 18px;border-radius:var(--radius-sm);
+  background:linear-gradient(135deg,rgba(16,185,129,.13),rgba(99,102,241,.07));
+  border:1px solid rgba(16,185,129,.25)}
+.ordertotal .l{font-size:.84rem;color:var(--text-secondary);font-weight:600}
+.ordertotal .v{font-size:1.5rem;font-weight:900;color:var(--success);font-variant-numeric:tabular-nums}
+.ordertotal .n{font-size:.72rem;color:var(--text-muted);width:100%;text-align:left}
+.combo{position:relative;min-width:250px}
+.combo input.q{width:100%;min-width:240px}
+.combo .panel{position:absolute;z-index:40;inset-inline-start:0;top:calc(100% + 4px);width:min(420px,80vw);
+  max-height:260px;overflow-y:auto;background:#0f1524;border:1px solid var(--border-glass);
+  border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.55);display:none}
+.combo .panel.open{display:block}
+.combo .opt{padding:8px 11px;font-size:.78rem;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.05);line-height:1.5}
+.combo .opt:last-child{border-bottom:none}
+.combo .opt:hover,.combo .opt.active{background:rgba(99,102,241,.18)}
+.combo .opt .c{color:var(--accent-light);font-weight:700}
+.combo .opt .s{color:var(--text-muted);font-size:.7rem}
+.combo .empty{padding:10px 12px;font-size:.75rem;color:var(--text-muted)}
+  .picked{font-size:.74rem;color:var(--success);margin-top:4px}
+  .customer-card,.line-tools,.discount-tools{margin:16px 0;padding:14px;border-radius:var(--radius-sm);
+    background:rgba(255,255,255,.025);border:1px solid var(--border-glass)}
+  .customer-card .head,.line-tools .head,.discount-tools .head{font-size:.84rem;font-weight:700;margin-bottom:10px}
+  .customer-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+  .customer-grid label,.line-tools label,.discount-tools label{display:flex;flex-direction:column;gap:5px;
+    font-size:.75rem;color:var(--text-secondary);font-weight:600}
+  .customer-grid .wide{grid-column:1/-1}
+  .line-tools-grid{display:grid;grid-template-columns:minmax(230px,1fr) 110px 130px auto;gap:10px;align-items:end}
+  .line-tools .combo{min-width:0}.line-tools .combo input.q{min-width:0}
+  .price-editor{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+  .price-editor input{width:88px}.price-override{color:#fcd34d;margin-top:4px}
+  .discount-tools{display:flex;align-items:end;gap:10px;flex-wrap:wrap}
+  .discount-tools label{min-width:150px}.discount-tools input{width:120px}
+  .history-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .history-actions input{min-width:220px}
+.upload-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px;align-items:center}
+.file-input{width:100%;padding:9px;background:rgba(255,255,255,.04);border:1px dashed var(--border-glass);
+  border-radius:var(--radius-sm);color:var(--text-secondary);font-family:inherit;font-size:.8rem}
+.history{width:100%;border-collapse:collapse;font-size:.82rem;min-width:660px}
+.history td,.history th{padding:9px 10px;border-top:1px solid var(--border-glass);text-align:right}
+.history tbody tr{cursor:pointer}
+.history tbody tr:hover{background:rgba(99,102,241,.07)}
+.spinner{width:15px;height:15px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;
+  border-radius:50%;animation:spin .7s linear infinite;display:inline-block}
+@keyframes spin{to{transform:rotate(360deg)}}
+.toast{position:fixed;bottom:22px;left:22px;padding:13px 20px;border-radius:var(--radius-sm);
+  font-size:.86rem;font-weight:600;box-shadow:var(--shadow);z-index:99;max-width:min(90vw,460px);
+  opacity:0;transform:translateY(14px);transition:opacity .25s,transform .25s;pointer-events:none}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.ok{background:#065f46;color:#d1fae5}
+.toast.err{background:#7f1d1d;color:#fee2e2}
+.toast.info{background:#1e3a5f;color:#dbeafe}
+  @media(max-width:760px){.line-tools-grid{grid-template-columns:1fr 1fr}.line-tools-grid .combo{grid-column:1/-1}}
+  @media(max-width:640px){.container{padding:20px 14px 50px}.brand h1{font-size:1.4rem}.line-tools-grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <div class="topbar">
+    <div class="brand">
+      <h1>{{ app_title }}</h1>
+      <p>من رسالة واتساب بالعامية إلى طلب مراجَع ومعتمد جاهز للتحضير</p>
+    </div>
+    <div class="topbar-right">
+      <span class="chip {% if extractor_available %}ok{% else %}warn{% endif %}">
+        {% if extractor_available %}الاستخراج متصل{% else %}الاستخراج غير متاح{% endif %}
+      </span>
+      <span class="chip" id="catalogChip">{{ catalog_count }} صنف في الكتالوج</span>
+      <span class="chip ok" id="operatorChip"></span>
+      <button class="btn btn-secondary btn-sm" onclick="logout()">خروج</button>
+    </div>
+  </div>
+
+  <!-- ============================ Catalog ============================ -->
+  <div class="card">
+    <div class="card-title">
+      <span>📦</span> كتالوج الأصناف
+      <span class="sp" id="catalogMeta"></span>
+      <button class="btn btn-secondary btn-sm" onclick="toggleCatalog()" id="catalogToggle">إدارة الكتالوج</button>
+    </div>
+    <div id="catalogPanel" class="hidden">
+      <p class="hint">
+        ارفع ملف الأصناف بتاعك (CSV أو Excel). لازم يكون فيه عمود <strong>كود المنتج</strong> وعمود
+        <strong>اسم المنتج</strong>. عمود <strong>المرادفات</strong> (أسماء بالعامية مفصولة بـ <strong>|</strong>)
+        اختياري لكنه بيرفع الدقة بشكل كبير. الرفع بيستبدل الكتالوج الحالي بالكامل —
+        الطلبات المعتمدة القديمة بتفضل زي ما هي بأسعارها وأسماءها وقت الاعتماد.
+      </p>
+      <div class="upload-grid">
+        <input type="file" id="catalogFile" class="file-input" accept=".csv,.tsv,.xlsx,.xlsm,text/csv">
+        <div class="row-actions" style="margin-top:0;justify-content:flex-start">
+          <button class="btn btn-primary btn-sm" onclick="uploadCatalog()" id="uploadBtn">رفع واستبدال</button>
+          <a class="btn btn-secondary btn-sm" href="/api/catalog/template" style="text-decoration:none">تحميل نموذج</a>
+        </div>
+      </div>
+      <div id="catalogResult" style="margin-top:14px"></div>
+    </div>
+  </div>
+
+  <!-- ======================== Shop settings ========================== -->
+  <div class="card">
+    <div class="card-title">
+      <span>🏪</span> بيانات المحل
+      <span class="sp" id="settingsMeta"></span>
+      <button class="btn btn-secondary btn-sm" onclick="toggleSettings()" id="settingsToggle">تعديل البيانات</button>
+    </div>
+    <div id="settingsPanel" class="hidden">
+      <p class="hint">
+        البيانات دي بتتطبع على <strong>إذن الصرف</strong> اللي بتحمّله مع كل طلب معتمد.
+        الشعار بيتخزّن جوه الملف نفسه، فالمستند بيفتح ويتطبع من غير إنترنت.
+      </p>
+      <div class="settings-grid">
+        <label>اسم المحل <span style="color:var(--danger)">*</span>
+          <input type="text" id="setShopName" maxlength="200" placeholder="سوبر ماركت النور"></label>
+        <label>العنوان
+          <input type="text" id="setShopAddress" maxlength="400" placeholder="٣ ش الجمهورية، طنطا"></label>
+        <label>التليفون
+          <input type="text" id="setShopPhone" maxlength="60" placeholder="01000000000"></label>
+        <label>الكود الضريبي
+          <input type="text" id="setTaxId" maxlength="60" placeholder="اختياري"></label>
+        <label>عنوان المستند <span style="color:var(--danger)">*</span>
+          <input type="text" id="setDocTitle" maxlength="80" placeholder="إذن صرف"></label>
+        <label>ملاحظة أسفل المستند
+          <input type="text" id="setFooterNote" maxlength="400" placeholder="البضاعة المباعة لا تُرد ولا تُستبدل"></label>
+      </div>
+      <p class="hint" style="margin-top:12px">
+        الكود الضريبي بيتكتب على المستند كنص للعرض بس. ده مستند داخلي لتحضير وتسليم الطلب
+        وبيتقفل بسطر توضيحي في آخره.
+      </p>
+      <div class="upload-grid" style="margin-top:10px">
+        <div>
+          <div class="hint">الشعار (PNG أو JPG، ٥٠٠ كيلوبايت كحد أقصى)</div>
+          <input type="file" id="logoFile" class="file-input" accept="image/png,image/jpeg">
+        </div>
+        <div id="logoPreviewBox"></div>
+      </div>
+      <div class="row-actions">
+        <button class="btn btn-secondary btn-sm" onclick="removeLogo()" id="removeLogoBtn">مسح الشعار</button>
+        <button class="btn btn-primary btn-sm" onclick="saveSettings()" id="saveSettingsBtn">حفظ البيانات</button>
+      </div>
+      <div id="settingsResult"></div>
+    </div>
+  </div>
+
+  <!-- ============================= Input ============================= -->
+  <div class="card">
+    <div class="card-title"><span>✍️</span> رسالة الطلب</div>
+    <textarea id="orderInput" placeholder="الصق رسالة الواتساب هنا…&#10;مثال: عايز 3 كراتين أكياس سودا 50 في 70 واتنين رول استرتش الكبير"></textarea>
+    <div class="samples" id="samples"></div>
+    <div class="row-actions">
+      <button class="btn btn-secondary" onclick="clearAll()">مسح</button>
+      <button class="btn btn-primary" onclick="processOrder()" id="analyzeBtn">تحليل الطلب</button>
+    </div>
+  </div>
+
+  <!-- ============================ Results ============================ -->
+  <div id="results" class="hidden">
+    <div id="statusBanner"></div>
+    <div class="stats" id="statsRow"></div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>📋</span> مراجعة السطور
+        <span class="sp">كل سطر محتاج قرار بشري صريح</span>
+      </div>
+
+      <p class="hint">
+        النظام بيرشّح أقرب صنف ويجهّزه مختار مسبقاً — <strong>لكنه مش بيعتمد أي حاجة لوحده</strong>.
+        راجع السطر، عدّل لو محتاج، وبعدين اضغط تأكيد.
+      </p>
+
+       <div id="unresolvedBanner"></div>
+
+       <div class="customer-card" id="customerDetails">
+         <div class="head">بيانات العميل</div>
+         <p class="hint">تتسجل مع الطلب قبل الاعتماد وتظهر في المستند وسجل الطلبات.</p>
+         <div class="customer-grid">
+           <label>اسم العميل
+             <input type="text" id="customerName" maxlength="200" autocomplete="name" placeholder="مثال: الأستاذ أحمد"></label>
+           <label>التليفون
+             <input type="text" id="customerPhone" maxlength="80" inputmode="tel" autocomplete="tel" placeholder="01000000000"></label>
+           <label class="wide">العنوان
+             <input type="text" id="customerAddress" maxlength="500" autocomplete="street-address" placeholder="العنوان للتسليم (اختياري)"></label>
+         </div>
+         <div class="row-actions">
+           <button class="btn btn-secondary btn-sm" type="button" id="saveCustomerBtn" onclick="saveCustomerDetails()">حفظ بيانات العميل</button>
+         </div>
+       </div>
+
+       <div class="table-wrap">
+        <table id="reviewTable">
+          <thead>
+            <tr>
+              <th>#</th><th>النص الأصلي</th><th>الصنف المطابق</th>
+              <th>الكمية</th><th>الوحدة</th>
+              <th class="col-price">سعر الوحدة</th><th class="col-price">الإجمالي</th>
+              <th>ثقة النموذج</th><th>الحالة</th><th>القرار</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody"></tbody>
+         </table>
+       </div>
+
+       <div class="line-tools" id="addLineTools">
+         <div class="head">إضافة صنف فات من التحليل</div>
+         <p class="hint">ابحث في الكتالوج ثم اختر الصنف وحدد الكمية والوحدة. الإضافة قرار بشري مسجل قبل الاعتماد.</p>
+         <div class="line-tools-grid">
+           <div class="combo" data-item="manual-new">
+             <input type="hidden" id="sku-manual-new" value="">
+             <input class="q" id="q-manual-new" data-item="manual-new" autocomplete="off"
+                    placeholder="اكتب اسم أو كود الصنف…">
+             <div class="panel" id="pan-manual-new"></div>
+           </div>
+           <label>الكمية
+             <input type="number" id="addLineQuantity" min="0.001" step="0.001" value="1"></label>
+           <label>الوحدة
+             <input type="text" id="addLineUnit" maxlength="80" placeholder="قطعة"></label>
+           <button class="btn btn-primary btn-sm" type="button" onclick="addManualLine()">إضافة السطر</button>
+         </div>
+       </div>
+
+       <div id="orderTotal"></div>
+
+       <div class="discount-tools" id="discountTools">
+         <label>خصم على الطلب (ج.م)
+           <input type="number" id="discountAmount" min="0" step="0.01" value="0"></label>
+         <button class="btn btn-secondary btn-sm" type="button" id="saveDiscountBtn" onclick="saveDiscount()">حفظ الخصم</button>
+       </div>
+
+       <div id="timeCard"></div>
+
+      <div class="identity">
+        <span>Human reviewer identity (required):</span>
+        <code id="reviewerName"></code>
+        <span>— كل قرار بيتسجّل بالاسم ده</span>
+      </div>
+
+      <div class="row-actions">
+        <button class="btn btn-secondary" onclick="clearAll()">طلب جديد</button>
+        <button class="btn btn-secondary" onclick="confirmAllRows()" id="confirmAllBtn">تأكيد السطور الأكيدة</button>
+        <button class="btn btn-primary" onclick="approveOrder()" id="approveBtn">اعتماد الطلب</button>
+        <button class="btn btn-success hidden" onclick="downloadDocument()" id="docBtn">تحميل المستند (HTML)</button>
+        <button class="btn btn-success hidden" onclick="downloadImage()" id="imgBtn">تحميل كصورة</button>
+        <button class="btn btn-success hidden" onclick="exportXlsx()" id="xlsxBtn">تصدير Excel (منسّق)</button>
+        <button class="btn btn-secondary hidden" onclick="exportCsv()" id="exportBtn">تصدير CSV (خام)</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================ History ============================ -->
+  <div class="card">
+    <div class="card-title">
+      <span>🕘</span> آخر الطلبات
+      <div class="history-actions sp">
+        <input type="search" id="historySearch" maxlength="200" placeholder="ابحث باسم العميل أو تليفونه">
+        <button class="btn btn-secondary btn-sm" type="button" onclick="loadOrders()">تحديث</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table class="history">
+        <thead>
+          <tr><th>#</th><th>العميل</th><th>الرسالة</th><th>السطور</th><th>الحالة</th><th>التاريخ</th></tr>
+        </thead>
+        <tbody id="historyBody"><tr><td colspan="6" style="color:var(--text-muted)">جارٍ التحميل…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * Every value that reaches the DOM is escaped. Order text originates
+ * from the merchant's own customers over WhatsApp, so it is untrusted
+ * input and must never be interpolated into HTML unescaped.
+ * ------------------------------------------------------------------ */
+const ESCAPES = { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;', '`':'&#96;' };
+function esc(value) {
+  if (value === null || value === undefined) return '';
+  return String(value).replace(/[&<>"'`]/g, (ch) => ESCAPES[ch]);
+}
+function num(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+const OPERATOR = {{ operator | tojson }};
+let catalogCount = 0;
+let currentOrder = null;
+let busy = false;
+
+document.getElementById('operatorChip').textContent = OPERATOR;
+document.getElementById('reviewerName').textContent = OPERATOR;
+
+const SAMPLES = [
+  'عايز 3 كراتين أكياس سودا 50 في 70 واتنين رول استرتش الكبير',
+  'ابعتلي 5 بريل كبير ودستة سلك ستيل',
+  'محتاج 4 جركن كلور مركز و اتنين ديتول كبير و 3 باكو جوانتى',
+  'تلات باكو ملاعق بلاستيك وخمس باكو شوك',
+  'عايز 10 بريل كبير لا خلي 7 بس',
+];
+
+function toast(message, kind) {
+  const el = document.getElementById('toast');
+  el.className = 'toast show ' + (kind || 'info');
+  el.textContent = message;
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => el.classList.remove('show'), 4200);
+}
+
+function actionId(prefix) {
+  const token = (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : Date.now().toString(36) + Math.random().toString(36).slice(2);
+  return `${prefix}-${token}`;
+}
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  if (response.status === 401) {
+    window.location.href = '/login';
+    throw new Error('unauthenticated');
+  }
+  return response;
+}
+
+async function readError(response, fallback) {
+  try {
+    const data = await response.json();
+    if (typeof data.detail === 'string') return data.detail;
+    if (Array.isArray(data.detail) && data.detail.length) {
+      return data.detail.map((d) => d.msg || '').filter(Boolean).join(' · ') || fallback;
+    }
+  } catch (_) { /* fall through */ }
+  return fallback;
+}
+
+/* ------------------------------ catalog --------------------------- */
+
+function toggleCatalog() {
+  const panel = document.getElementById('catalogPanel');
+  panel.classList.toggle('hidden');
+  document.getElementById('catalogToggle').textContent =
+    panel.classList.contains('hidden') ? 'إدارة الكتالوج' : 'إخفاء';
+}
+
+async function loadCatalog() {
+  try {
+    const infoResponse = await api('/api/catalog/info');
+    if (infoResponse.ok) {
+      const info = await infoResponse.json();
+      catalogCount = info.product_count || 0;
+      document.getElementById('catalogChip').textContent = `${catalogCount} صنف في الكتالوج`;
+      const version = info.version;
+      document.getElementById('catalogMeta').textContent = version
+        ? `آخر تحديث: ${new Date(version.created_at).toLocaleString('ar-EG')} — ${version.source_name || ''}`
+        : '';
+    }
+  } catch (error) { /* handled by api() */ }
+}
+
+async function uploadCatalog() {
+  const input = document.getElementById('catalogFile');
+  const box = document.getElementById('catalogResult');
+  if (!input.files || !input.files.length) {
+    toast('اختار ملف الأول', 'err');
+    return;
+  }
+  const button = document.getElementById('uploadBtn');
+  button.disabled = true;
+  button.innerHTML = '<span class="spinner"></span> جارٍ الرفع';
+  box.innerHTML = '';
+
+  try {
+    const body = new FormData();
+    body.append('file', input.files[0]);
+    const response = await api('/api/catalog/upload', { method: 'POST', body });
+
+    if (!response.ok) {
+      const message = await readError(response, 'تعذّر رفع الكتالوج.');
+      box.innerHTML = `<div class="banner err">⚠️ ${esc(message)}</div>`;
+    } else {
+      const result = await response.json();
+      const warnings = (result.warnings || [])
+        .map((w) => `<div class="banner warn">ℹ️ ${esc(w)}</div>`).join('');
+      box.innerHTML =
+        `<div class="banner ok">✅ تم تركيب ${esc(result.product_count)} صنف من «${esc(result.source_name || '')}»` +
+        ` — الترميز: ${esc(result.detected_encoding || '')}</div>` + warnings;
+      await loadCatalog();
+      toast(`الكتالوج اتحدّث: ${result.product_count} صنف`, 'ok');
+    }
+  } catch (error) {
+    box.innerHTML = '<div class="banner err">⚠️ تعذّر الاتصال بالخادم.</div>';
+  }
+  button.disabled = false;
+  button.textContent = 'رفع واستبدال';
+}
+
+/* ------------------------------ process --------------------------- */
+
+async function processOrder() {
+  if (busy) return;
+  const message = document.getElementById('orderInput').value.trim();
+  if (!message) { toast('اكتب رسالة الطلب الأول', 'err'); return; }
+
+  busy = true;
+  const button = document.getElementById('analyzeBtn');
+  button.disabled = true;
+  button.innerHTML = '<span class="spinner"></span> جارٍ التحليل';
+
+  try {
+    const response = await api('/api/process', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    if (!response.ok) {
+      toast(await readError(response, 'تعذّر تحليل الطلب.'), 'err');
+    } else {
+      currentOrder = await response.json();
+      render();
+      document.getElementById('results').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      loadOrders();
+    }
+  } catch (error) { /* handled by api() */ }
+
+  busy = false;
+  button.disabled = false;
+  button.textContent = 'تحليل الطلب';
+}
+
+async function openOrder(orderId) {
+  try {
+    const response = await api(`/api/orders/${orderId}`);
+    if (!response.ok) { toast('تعذّر فتح الطلب.', 'err'); return; }
+    currentOrder = await response.json();
+    render();
+    document.getElementById('results').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (error) { /* handled by api() */ }
+}
+
+/* ------------------------------- render --------------------------- */
+
+function comboFor(item) {
+  // Only this line's shortlist is rendered. The rest of the catalog is reached
+  // by typing, which queries the server — the browser never holds it all.
+  const sku  = item.is_human_confirmed ? (item.human_selected_sku || '')
+             : (item.recommended_product ? item.recommended_product.product_id : '');
+  const name = item.is_human_confirmed
+             ? (item.matched_product ? item.matched_product.product_name : '')
+             : (item.recommended_product ? item.recommended_product.product_name : '');
+  const label = sku ? `${name} (${sku})` : '';
+  return `<div class="combo" data-item="${esc(item.id)}">
+      <input type="hidden" id="sku-${esc(item.id)}" value="${esc(sku)}">
+      <input class="q" id="q-${esc(item.id)}" data-item="${esc(item.id)}" autocomplete="off"
+             placeholder="اكتب اسم أو كود الصنف…" value="${esc(label)}">
+      <div class="panel" id="pan-${esc(item.id)}"></div>
+    </div>`;
+}
+
+function renderOptions(itemId, list, note) {
+  const panel = document.getElementById(`pan-${itemId}`);
+  if (!panel) return;
+  if (!list.length) {
+    panel.innerHTML = `<div class="empty">${esc(note || 'مفيش نتائج — جرّب كلمة تانية')}</div>`;
+  } else {
+    panel.innerHTML = list.map((c) =>
+      `<div class="opt" data-item="${esc(itemId)}" data-sku="${esc(c.product_id)}"
+            data-name="${esc(c.product_name)}" data-unit="${esc(c.unit || '')}">
+         <span class="c">${esc(c.product_id)}</span> — ${esc(c.product_name)}
+         <div class="s">${esc(c.unit || '')} · ${esc(c.price ?? 0)} ج.م${
+           c.score != null ? ' · تطابق ' + Math.round(num(c.score, 0) * 100) + '%' : ''}</div>
+       </div>`).join('');
+  }
+  panel.classList.add('open');
+}
+
+function shortlistOf(itemId) {
+  const item = ((currentOrder && currentOrder.items) || []).find((i) => String(i.id) === String(itemId));
+  return item ? (item.candidates || []) : [];
+}
+
+let searchTimer = null;
+function onComboInput(itemId, value) {
+  clearTimeout(searchTimer);
+  const q = (value || '').trim();
+  if (!q) { renderOptions(itemId, shortlistOf(itemId), 'ابدأ بالكتابة للبحث في الكتالوج'); return; }
+  searchTimer = setTimeout(async () => {
+    try {
+      const r = await api(`/api/catalog/search?q=${encodeURIComponent(q)}&limit=15`);
+      renderOptions(itemId, r.ok ? await r.json() : []);
+    } catch (e) { /* handled by api() */ }
+  }, 220);
+}
+
+function pickProduct(itemId, sku, name, unit) {
+  const hidden = document.getElementById(`sku-${itemId}`);
+  const box = document.getElementById(`q-${itemId}`);
+  const panel = document.getElementById(`pan-${itemId}`);
+  if (hidden) hidden.value = sku;
+  if (box) box.value = `${name} (${sku})`;
+  if (String(itemId) === 'manual-new') {
+    const unitBox = document.getElementById('addLineUnit');
+    if (unitBox && !unitBox.value.trim()) unitBox.value = unit || '';
+  }
+  if (panel) panel.classList.remove('open');
+}
+
+function closeAllPanels(except) {
+  document.querySelectorAll('.combo .panel.open').forEach((p) => {
+    if (p.id !== except) p.classList.remove('open');
+  });
+}
+
+/* -------------------------- money and totals ---------------------- *
+ * The unit price for a line is the one the human locked in once the row
+ * is confirmed (which after approval comes from the frozen snapshot), and
+ * the model's advisory suggestion before that. NOT_FOUND lines have no
+ * price and are never counted — the merchant is not charging for them.
+ * ------------------------------------------------------------------ */
+
+function fmtMoney(value) {
+  return num(value, 0).toLocaleString('en-US',
+    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function round2(value) {
+  return Math.round((num(value, 0) + Number.EPSILON) * 100) / 100;
+}
+
+function unitPriceOf(item) {
+  if (item.human_decision === 'NOT_FOUND') return null;
+  const product = item.matched_product || item.recommended_product;
+  return product ? num(product.price, 0) : null;
+}
+
+function liveQuantity(item) {
+  const box = document.getElementById(`qty-${item.id}`);
+  const typed = box ? num(box.value, NaN) : NaN;
+  return Number.isFinite(typed) && typed > 0 ? typed : num(item.extracted_quantity, 0);
+}
+
+function lineTotalOf(item) {
+  const price = unitPriceOf(item);
+  if (price === null) return null;
+  return round2(price * liveQuantity(item));
+}
+
+function orderHasPrices(data) {
+  return (data.items || []).some((i) => num(unitPriceOf(i), 0) > 0);
+}
+
+function orderTotalOf(data) {
+  return round2((data.items || []).reduce(
+    (sum, item) => sum + num(lineTotalOf(item), 0), 0));
+}
+
+/* Recomputed on every quantity keystroke, so the number next to the approve
+   button is never stale relative to what is on screen. */
+function refreshTotals() {
+  const data = currentOrder;
+  const box = document.getElementById('orderTotal');
+  if (!data || !orderHasPrices(data)) { box.innerHTML = ''; return; }
+
+  data.items.forEach((item) => {
+    const cell = document.getElementById(`line-total-${item.id}`);
+    if (!cell) return;
+    const total = lineTotalOf(item);
+    cell.textContent = total === null ? '—' : fmtMoney(total);
+  });
+
+  const excluded = data.items.filter((i) => i.human_decision === 'NOT_FOUND').length;
+  box.innerHTML =
+    '<div class="ordertotal"><span class="l">إجمالي الطلب:</span>' +
+    `<span class="v">${esc(fmtMoney(orderTotalOf(data)))} ج.م</span>` +
+    (excluded
+      ? `<span class="n">مش شامل ${esc(excluded)} صنف غير موجود بالكتالوج</span>`
+      : '') +
+    '</div>';
+}
+
+function legacyRender() {
+  const data = currentOrder;
+  if (!data) return;
+  document.getElementById('results').classList.remove('hidden');
+
+  const approved = data.status === 'approved';
+  const confirmed = data.items.filter((i) => i.is_human_confirmed).length;
+  const pending = data.items.length - confirmed;
+  const showPrices = orderHasPrices(data);
+
+  document.getElementById('reviewTable').classList.toggle('no-prices', !showPrices);
+
+  // Whatever the extractor could not turn into a line is the merchant's
+  // problem to read, not something to drop on the floor.
+  const unresolved = data.unresolved || [];
+  document.getElementById('unresolvedBanner').innerHTML = unresolved.length
+    ? '<div class="banner warn">⚠️ جزء من الرسالة لم يُفهَم — راجعه بنفسك: ' +
+      unresolved.map((u) => `«${esc(u)}»`).join(' · ') + '</div>'
+    : '';
+
+  document.getElementById('statusBanner').innerHTML = approved
+    ? `<div class="banner ok">✅ الطلب #${esc(data.order_id)} معتمد — جاهز للتصدير</div>`
+    : (pending === 0
+      ? '<div class="banner info">👍 كل السطور اتراجعت. اضغط «اعتماد الطلب».</div>'
+      : `<div class="banner warn">⚠️ الطلب #${esc(data.order_id)} — فاضل ${esc(pending)} سطر محتاج قرار</div>`);
+
+  document.getElementById('statsRow').innerHTML =
+    `<div class="stat"><div class="stat-value">${esc(data.items.length)}</div>` +
+    '<div class="stat-label">إجمالي السطور</div></div>' +
+    `<div class="stat"><div class="stat-value" style="color:var(--success)">${esc(confirmed)}</div>` +
+    '<div class="stat-label">مؤكد بشرياً</div></div>' +
+    `<div class="stat"><div class="stat-value" style="color:var(--warning)">${esc(pending)}</div>` +
+    '<div class="stat-label">في انتظار قرار</div></div>';
+
+  const tbody = document.getElementById('resultsBody');
+  tbody.innerHTML = '';
+
+  data.items.forEach((item, index) => {
+    const tr = document.createElement('tr');
+    if (item.is_human_confirmed && item.human_decision === 'SELECT') tr.className = 'confirmed';
+    if (item.human_decision === 'NOT_FOUND') tr.className = 'excluded';
+
+    const locked = approved || item.is_human_confirmed;
+    const confidence = Math.round(num(item.confidence, 0) * 100);
+
+    let productCell;
+    if (item.human_decision === 'NOT_FOUND') {
+      productCell = '<strong style="color:var(--warning)">مستبعد بقرار بشري — غير موجود بالكتالوج</strong>';
+    } else {
+      let suggestion;
+      if (!item.recommended_product) {
+        suggestion = '<div class="hint" style="color:var(--warning)">النموذج ملقاش ترشيح — اختار من الكتالوج أو أكّد إنه غير موجود</div>';
+      } else if (item.recommendation_decision === 'REVIEW') {
+        suggestion = '<div class="hint" style="color:var(--warning)">⚠️ فيه أصناف تانية قريبة جداً — اتأكد من الحجم/العبوة قبل التأكيد.<br>' +
+          `الأقرب: <strong>${esc(item.recommended_product.product_name)}</strong></div>`;
+      } else {
+        suggestion = `<div class="hint">اقتراح النموذج (غير معتمد): <strong>${esc(item.recommended_product.product_name)}</strong></div>`;
+      }
+      productCell = suggestion + (locked
+        ? `<strong>${esc(item.matched_product ? item.matched_product.product_name : '')}</strong>`
+        : comboFor(item));
+    }
+
+    // An excluded line keeps its own badge after approval: it is absent from
+    // the snapshot, the total and the picking document, so calling it
+    // "مُعتمد" would tell the operator the warehouse is picking it.
+    let statusBadge;
+    if (item.human_decision === 'NOT_FOUND') statusBadge = '<span class="badge gone">غير موجود</span>';
+    else if (approved) statusBadge = '<span class="badge appr">مُعتمد</span>';
+    else if (item.is_human_confirmed) statusBadge = '<span class="badge done">مؤكد</span>';
+    else statusBadge = '<span class="badge pending">محتاج قرار</span>';
+
+    const decisionCell = locked
+      ? `<span class="hint">${esc(item.human_actor || '')}</span>`
+      : `<button class="btn btn-primary btn-sm" onclick="confirmRow(${esc(item.id)})">تأكيد</button> ` +
+        `<button class="btn btn-secondary btn-sm" onclick="markNotFound(${esc(item.id)})">غير موجود</button>`;
+
+    const unitPrice = unitPriceOf(item);
+    const lineTotal = lineTotalOf(item);
+
+    tr.innerHTML =
+      `<td>${index + 1}</td>` +
+      `<td style="color:var(--text-secondary);max-width:230px">${esc(item.raw_text)}</td>` +
+      `<td>${productCell}</td>` +
+      `<td><input type="number" step="0.5" min="0.1" style="width:78px" id="qty-${esc(item.id)}" ` +
+      `value="${esc(num(item.extracted_quantity, 1))}" ${locked ? 'disabled' : ''}></td>` +
+      `<td><input type="text" style="width:88px" id="unit-${esc(item.id)}" ` +
+      `value="${esc(item.extracted_unit)}" ${locked ? 'disabled' : ''}></td>` +
+      `<td class="col-price money">${unitPrice === null ? '—' : esc(fmtMoney(unitPrice))}</td>` +
+      `<td class="col-price money" id="line-total-${esc(item.id)}">` +
+      `${lineTotal === null ? '—' : esc(fmtMoney(lineTotal))}</td>` +
+      `<td><strong style="color:${confidence > 80 ? 'var(--success)' : 'var(--warning)'}">${confidence}%</strong></td>` +
+      `<td>${statusBadge}</td>` +
+      `<td style="white-space:nowrap">${decisionCell}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  refreshTotals();
+  renderTimeCard(data, approved);
+
+  document.getElementById('approveBtn').disabled = approved || pending > 0;
+  document.getElementById('approveBtn').textContent = approved ? 'تم الاعتماد' : 'اعتماد الطلب';
+  const batchable = data.items.filter(
+    (i) => !i.is_human_confirmed && i.recommendation_decision === 'SELECT').length;
+  const bulkBtn = document.getElementById('confirmAllBtn');
+  bulkBtn.classList.toggle('hidden', approved || batchable === 0);
+  bulkBtn.textContent = `تأكيد السطور الأكيدة (${batchable})`;
+  ['docBtn', 'imgBtn', 'xlsxBtn', 'exportBtn'].forEach((id) => {
+    document.getElementById(id).classList.toggle('hidden', !approved);
+  });
+}
+
+/* ------------------------ order flexibility ----------------------- */
+
+function flexOptionalNumber(value) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function flexIsNotFound(item) {
+  return Boolean(item && (item.human_decision === 'NOT_FOUND' || item.status === 'not_found_confirmed'));
+}
+
+function flexIsCancelled(item) {
+  return Boolean(item && (
+    item.status === 'cancelled_by_human' || item.human_decision === 'CANCELLED' || item.is_cancelled === true
+  ));
+}
+
+function flexIsExcluded(item) {
+  return flexIsNotFound(item) || flexIsCancelled(item);
+}
+
+function flexPriceOverride(item) {
+  for (const key of ['price_override', 'unit_price_override', 'override_price']) {
+    const value = flexOptionalNumber(item && item[key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function flexCatalogPrice(item) {
+  for (const key of ['catalog_price', 'original_catalog_price']) {
+    const value = flexOptionalNumber(item && item[key]);
+    if (value !== null) return value;
+  }
+  const product = item && (item.matched_product || item.recommended_product);
+  return product ? flexOptionalNumber(product.price) : flexOptionalNumber(item && item.price);
+}
+
+function flexPriceOverridden(item) {
+  return Boolean(item && (
+    item.price_overridden || item.is_price_overridden || flexPriceOverride(item) !== null
+  ));
+}
+
+function flexUnitPrice(item) {
+  if (flexIsExcluded(item)) return null;
+  const override = flexPriceOverride(item);
+  if (override !== null) return override;
+  const product = item && (item.matched_product || item.recommended_product);
+  return product ? flexOptionalNumber(product.price) : flexCatalogPrice(item);
+}
+
+function flexLiveUnitPrice(item) {
+  const input = document.getElementById(`price-${item.id}`);
+  const typed = input ? flexOptionalNumber(input.value) : null;
+  return typed !== null && typed >= 0 ? typed : flexUnitPrice(item);
+}
+
+function flexLiveQuantity(item) {
+  const input = document.getElementById(`qty-${item.id}`);
+  const typed = input ? flexOptionalNumber(input.value) : null;
+  return typed !== null && typed > 0 ? typed : num(item.extracted_quantity, 0);
+}
+
+function flexLineTotal(item) {
+  const price = flexLiveUnitPrice(item);
+  return price === null ? null : round2(price * flexLiveQuantity(item));
+}
+
+function flexStoredDiscount(data) {
+  const discount = flexOptionalNumber(data && data.discount);
+  return discount !== null && discount >= 0 ? discount : 0;
+}
+
+function flexLiveDiscount(data) {
+  const input = document.getElementById('discountAmount');
+  const typed = input ? flexOptionalNumber(input.value) : null;
+  return typed !== null && typed >= 0 ? typed : flexStoredDiscount(data);
+}
+
+function flexSubtotal(data) {
+  return round2(((data && data.items) || []).reduce(
+    (sum, item) => sum + num(flexLineTotal(item), 0), 0));
+}
+
+function flexGrandTotal(data) {
+  return round2(flexSubtotal(data) - flexLiveDiscount(data));
+}
+
+function flexHasPrices(data) {
+  return ((data && data.items) || []).some((item) =>
+    !flexIsExcluded(item) && num(flexUnitPrice(item), 0) > 0);
+}
+
+function flexRefreshTotals() {
+  const data = currentOrder;
+  const box = document.getElementById('orderTotal');
+  if (!data) { box.innerHTML = ''; return; }
+
+  (data.items || []).forEach((item) => {
+    const cell = document.getElementById(`line-total-${item.id}`);
+    if (!cell) return;
+    const total = flexLineTotal(item);
+    cell.textContent = total === null ? '—' : fmtMoney(total);
+  });
+
+  const subtotal = flexSubtotal(data);
+  const discount = flexLiveDiscount(data);
+  const notFound = (data.items || []).filter(flexIsNotFound).length;
+  const cancelled = (data.items || []).filter(flexIsCancelled).length;
+  if (!flexHasPrices(data) && discount === 0) { box.innerHTML = ''; return; }
+
+  const notes = [];
+  if (notFound) notes.push(`مش شامل ${esc(notFound)} صنف غير موجود بالكتالوج`);
+  if (cancelled) notes.push(`مش شامل ${esc(cancelled)} سطر اتلغى بطلب العميل`);
+  box.innerHTML =
+    '<div class="ordertotal"><span class="l">إجمالي الطلب:</span>' +
+    `<span class="v">${esc(fmtMoney(flexGrandTotal(data)))} ج.م</span>` +
+    `<span class="n">قبل الخصم: ${esc(fmtMoney(subtotal))} ج.م · الخصم: ${esc(fmtMoney(discount))} ج.م</span>` +
+    (notes.length ? `<span class="n">${notes.join(' · ')}</span>` : '') +
+    '</div>';
+}
+
+function renderCustomerDetails(data, approved) {
+  [
+    ['customerName', 'customer_name'],
+    ['customerPhone', 'customer_phone'],
+    ['customerAddress', 'customer_address'],
+  ].forEach(([elementId, key]) => {
+    const input = document.getElementById(elementId);
+    input.value = data[key] || '';
+    input.disabled = approved;
+  });
+  document.getElementById('saveCustomerBtn').classList.toggle('hidden', approved);
+}
+
+function renderDiscountTools(data, approved) {
+  const input = document.getElementById('discountAmount');
+  input.value = flexStoredDiscount(data).toFixed(2);
+  input.disabled = approved;
+  document.getElementById('saveDiscountBtn').classList.toggle('hidden', approved);
+}
+
+function flexPriceCell(item, canOverride) {
+  const price = flexUnitPrice(item);
+  if (price === null) return '—';
+  const catalogPrice = flexCatalogPrice(item);
+  const editor = canOverride
+    ? `<div class="price-editor"><input type="number" id="price-${esc(item.id)}" min="0" step="0.01" value="${esc(price)}">` +
+      `<button class="btn btn-secondary btn-sm" onclick="savePriceOverride(${esc(item.id)})">حفظ</button></div>`
+    : esc(fmtMoney(price));
+  const marker = flexPriceOverridden(item)
+    ? `<div class="hint price-override">سعر خاص${catalogPrice !== null ? ` · الكتالوج ${esc(fmtMoney(catalogPrice))}` : ''}</div>`
+    : '';
+  return editor + marker;
+}
+
+function render() {
+  const data = currentOrder;
+  if (!data) return;
+  document.getElementById('results').classList.remove('hidden');
+
+  const items = data.items || [];
+  const approved = data.status === 'approved';
+  const activeItems = items.filter((item) => !flexIsCancelled(item));
+  const cancelledCount = items.length - activeItems.length;
+  const confirmed = activeItems.filter((item) => item.is_human_confirmed).length;
+  const pending = activeItems.filter((item) => !item.is_human_confirmed && !flexIsExcluded(item)).length;
+
+  document.getElementById('reviewTable').classList.toggle('no-prices', !flexHasPrices(data));
+  document.getElementById('addLineTools').classList.toggle('hidden', approved);
+  renderCustomerDetails(data, approved);
+  renderDiscountTools(data, approved);
+
+  const unresolved = data.unresolved || [];
+  document.getElementById('unresolvedBanner').innerHTML = unresolved.length
+    ? '<div class="banner warn">⚠️ جزء من الرسالة لم يُفهَم — راجعه بنفسك: ' +
+      unresolved.map((value) => `«${esc(value)}»`).join(' · ') + '</div>'
+    : '';
+
+  document.getElementById('statusBanner').innerHTML = approved
+    ? `<div class="banner ok">✅ الطلب #${esc(data.order_id)} مُعتمد — جاهز للتصدير</div>`
+    : (pending === 0
+      ? '<div class="banner info">👍 كل السطور النشطة اتراجعت. اضغط «اعتماد الطلب».</div>'
+      : `<div class="banner warn">⚠️ الطلب #${esc(data.order_id)} — فاضل ${esc(pending)} سطر محتاج قرار</div>`);
+
+  document.getElementById('statsRow').innerHTML =
+    `<div class="stat"><div class="stat-value">${esc(activeItems.length)}</div>` +
+    '<div class="stat-label">سطور نشطة</div></div>' +
+    `<div class="stat"><div class="stat-value" style="color:var(--success)">${esc(confirmed)}</div>` +
+    '<div class="stat-label">مؤكد بشرياً</div></div>' +
+    `<div class="stat"><div class="stat-value" style="color:var(--warning)">${esc(pending)}</div>` +
+    '<div class="stat-label">في انتظار قرار</div></div>' +
+    (cancelledCount
+      ? `<div class="stat"><div class="stat-value" style="color:var(--danger)">${esc(cancelledCount)}</div>` +
+        '<div class="stat-label">ألغاه العميل</div></div>'
+      : '');
+
+  const tbody = document.getElementById('resultsBody');
+  tbody.innerHTML = '';
+  items.forEach((item, index) => {
+    const tr = document.createElement('tr');
+    if (flexIsCancelled(item)) tr.className = 'cancelled';
+    else if (flexIsNotFound(item)) tr.className = 'excluded';
+    else if (item.is_human_confirmed && item.human_decision === 'SELECT') tr.className = 'confirmed';
+
+    const reviewLocked = approved || item.is_human_confirmed || flexIsExcluded(item);
+    const confidence = Math.round(num(item.confidence, 0) * 100);
+    let productCell;
+    if (flexIsCancelled(item)) {
+      productCell = '<strong style="color:var(--danger)">اتلغى بطلب العميل</strong>';
+    } else if (flexIsNotFound(item)) {
+      productCell = '<strong style="color:var(--warning)">مستبعد بقرار بشري — غير موجود بالكتالوج</strong>';
+    } else {
+      let suggestion;
+      if (item.is_manual_line) {
+        suggestion = '<div class="hint">اتضاف يدوياً بقرار بشري.</div>';
+      } else if (!item.recommended_product) {
+        suggestion = '<div class="hint" style="color:var(--warning)">النموذج ملقاش ترشيح — اختار من الكتالوج أو أكّد إنه غير موجود</div>';
+      } else if (item.recommendation_decision === 'REVIEW') {
+        suggestion = '<div class="hint" style="color:var(--warning)">⚠️ فيه أصناف تانية قريبة جداً — اتأكد من الحجم/العبوة قبل التأكيد.<br>' +
+          `الأقرب: <strong>${esc(item.recommended_product.product_name)}</strong></div>`;
+      } else {
+        suggestion = `<div class="hint">اقتراح النموذج (غير معتمد): <strong>${esc(item.recommended_product.product_name)}</strong></div>`;
+      }
+      const selected = item.matched_product || item.recommended_product;
+      productCell = suggestion + (reviewLocked
+        ? `<strong>${esc(selected ? selected.product_name : '')}</strong>`
+        : comboFor(item));
+    }
+
+    let statusBadge;
+    if (flexIsCancelled(item)) statusBadge = '<span class="badge cancelled">ملغي</span>';
+    else if (flexIsNotFound(item)) statusBadge = '<span class="badge gone">غير موجود</span>';
+    else if (approved) statusBadge = '<span class="badge appr">مُعتمد</span>';
+    else if (item.is_human_confirmed) statusBadge = '<span class="badge done">مؤكد</span>';
+    else statusBadge = '<span class="badge pending">محتاج قرار</span>';
+
+    let decisionCell;
+    if (approved || flexIsCancelled(item)) {
+      decisionCell = `<span class="hint">${esc(item.human_actor || '')}</span>`;
+    } else if (flexIsNotFound(item)) {
+      decisionCell = `<span class="hint">${esc(item.human_actor || '')}</span> ` +
+        `<button class="btn btn-secondary btn-sm" onclick="cancelLine(${esc(item.id)})">إلغاء السطر</button>`;
+    } else {
+      decisionCell = item.is_human_confirmed
+        ? `<span class="hint">${esc(item.human_actor || '')}</span> `
+        : `<button class="btn btn-primary btn-sm" onclick="confirmRow(${esc(item.id)})">تأكيد</button> ` +
+          `<button class="btn btn-secondary btn-sm" onclick="markNotFound(${esc(item.id)})">غير موجود</button> `;
+      decisionCell += `<button class="btn btn-secondary btn-sm" onclick="cancelLine(${esc(item.id)})">إلغاء السطر</button>`;
+    }
+
+    const unitPrice = flexUnitPrice(item);
+    const lineTotal = flexLineTotal(item);
+    const canOverride = !approved && !flexIsExcluded(item) && item.is_human_confirmed && unitPrice !== null;
+    tr.innerHTML =
+      `<td>${index + 1}</td>` +
+      `<td style="color:var(--text-secondary);max-width:230px">${esc(item.raw_text)}</td>` +
+      `<td>${productCell}</td>` +
+      `<td><input type="number" step="0.5" min="0.1" style="width:78px" id="qty-${esc(item.id)}" ` +
+      `value="${esc(num(item.extracted_quantity, 1))}" ${reviewLocked ? 'disabled' : ''}></td>` +
+      `<td><input type="text" style="width:88px" id="unit-${esc(item.id)}" ` +
+      `value="${esc(item.extracted_unit)}" ${reviewLocked ? 'disabled' : ''}></td>` +
+      `<td class="col-price money">${flexPriceCell(item, canOverride)}</td>` +
+      `<td class="col-price money" id="line-total-${esc(item.id)}">` +
+      `${lineTotal === null ? '—' : esc(fmtMoney(lineTotal))}</td>` +
+      `<td><strong style="color:${confidence > 80 ? 'var(--success)' : 'var(--warning)'}">${confidence}%</strong></td>` +
+      `<td>${statusBadge}</td>` +
+      `<td style="white-space:nowrap">${decisionCell}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  flexRefreshTotals();
+  renderTimeCard(data, approved);
+  document.getElementById('approveBtn').disabled = approved || pending > 0;
+  document.getElementById('approveBtn').textContent = approved ? 'تم الاعتماد' : 'اعتماد الطلب';
+  const batchable = activeItems.filter((item) =>
+    !item.is_human_confirmed && !flexIsExcluded(item) && item.recommendation_decision === 'SELECT').length;
+  const bulkBtn = document.getElementById('confirmAllBtn');
+  bulkBtn.classList.toggle('hidden', approved || batchable === 0);
+  bulkBtn.textContent = `تأكيد السطور الأكيدة (${batchable})`;
+  ['docBtn', 'imgBtn', 'xlsxBtn', 'exportBtn'].forEach((id) => {
+    document.getElementById(id).classList.toggle('hidden', !approved);
+  });
+}
+
+function renderTimeCard(data, approved) {
+  const box = document.getElementById('timeCard');
+  const t = data.time_saved;
+  if (!t) { box.innerHTML = ''; return; }
+
+  const systemSeconds = (num(t.actual_system_time_ms, 0) / 1000).toFixed(2);
+  const manualSeconds = Math.round(num(t.estimated_manual_time_ms, 0) / 1000);
+
+  if (!approved || !t.is_measured) {
+    box.innerHTML = '<div class="timecard">' +
+      `<div class="t">⏱️ زمن المعالجة الآلية: ${esc(systemSeconds)} ثانية</div>` +
+      '<div class="d">الوقت الموفَّر بيتحسب بعد اعتماد الطلب — لسه المراجعة البشرية ما خلصتش.</div>' +
+      `<div class="m">خط الأساس اليدوي للمقارنة: ${esc(manualSeconds)} ثانية تقديري (45 ثانية لكل صنف).</div>` +
+      '</div>';
+    return;
+  }
+
+  box.innerHTML = '<div class="timecard">' +
+    `<div class="t">⏱️ الدورة الكاملة (من التحليل للاعتماد): ${esc(t.review_cycle_seconds)} ثانية</div>` +
+    '<div class="d">مقابل خط أساس يدوي تقديري: ' +
+    `<strong>${esc(manualSeconds)} ثانية</strong> — الفرق المقيس: <strong>${esc(t.saved_seconds)} ثانية</strong>.</div>` +
+    '<div class="m">زمن الدورة مقيس فعلياً. خط الأساس اليدوي تقدير (45 ثانية لكل صنف) ولازم يتعاير على شغلك الحقيقي.</div>' +
+    '</div>';
+}
+
+/* ----------------------------- decisions -------------------------- */
+
+async function refreshCurrentOrder() {
+  if (!currentOrder) return;
+  const response = await api(`/api/orders/${currentOrder.order_id}`);
+  if (!response.ok) throw new Error(await readError(response, 'تعذّر تحديث الطلب.'));
+  currentOrder = await response.json();
+}
+
+async function applyOrderMutation(path, method, payload, fallback) {
+  const response = await api(path, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(await readError(response, fallback));
+
+  let updated = null;
+  try { updated = await response.json(); } catch (_) { /* reload below */ }
+  if (updated && Array.isArray(updated.items)) currentOrder = updated;
+  else await refreshCurrentOrder();
+  render();
+  loadOrders();
+  return currentOrder;
+}
+
+async function saveCustomerDetails() {
+  if (!currentOrder || currentOrder.status === 'approved') return;
+  const button = document.getElementById('saveCustomerBtn');
+  button.disabled = true;
+  try {
+    await applyOrderMutation(`/api/orders/${currentOrder.order_id}/customer`, 'PUT', {
+      actor: OPERATOR,
+      action_id: actionId('customer-details'),
+      customer_name: document.getElementById('customerName').value.trim(),
+      customer_phone: document.getElementById('customerPhone').value.trim(),
+      customer_address: document.getElementById('customerAddress').value.trim(),
+    }, 'تعذّر حفظ بيانات العميل.');
+    toast('اتحفظت بيانات العميل', 'ok');
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+  button.disabled = false;
+}
+
+async function addManualLine() {
+  if (!currentOrder || currentOrder.status === 'approved') return;
+  const sku = document.getElementById('sku-manual-new').value;
+  const quantity = flexOptionalNumber(document.getElementById('addLineQuantity').value);
+  const unit = document.getElementById('addLineUnit').value.trim();
+  if (!sku) { toast('اختار الصنف من الكتالوج الأول', 'err'); return; }
+  if (quantity === null || quantity <= 0) { toast('الكمية لازم تكون أكبر من صفر', 'err'); return; }
+  if (!unit) { toast('اكتب الوحدة', 'err'); return; }
+
+  try {
+    await applyOrderMutation(`/api/orders/${currentOrder.order_id}/items`, 'POST', {
+      actor: OPERATOR,
+      action_id: actionId('add-line'),
+      selected_sku: sku,
+      quantity,
+      unit,
+    }, 'تعذّرت إضافة السطر.');
+    document.getElementById('sku-manual-new').value = '';
+    document.getElementById('q-manual-new').value = '';
+    document.getElementById('addLineQuantity').value = '1';
+    document.getElementById('addLineUnit').value = '';
+    toast('اتضاف السطر بقرار بشري مسجل', 'ok');
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
+async function cancelLine(itemId) {
+  if (!currentOrder || currentOrder.status === 'approved') return;
+  try {
+    await applyOrderMutation(`/api/orders/${currentOrder.order_id}/items/${itemId}`, 'DELETE', {
+      actor: OPERATOR,
+      action_id: actionId('cancel-line'),
+    }, 'تعذّر إلغاء السطر.');
+    toast('اتلغى السطر وفضل موجود في سجل المراجعة', 'ok');
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
+async function savePriceOverride(itemId) {
+  if (!currentOrder || currentOrder.status === 'approved') return;
+  const input = document.getElementById(`price-${itemId}`);
+  const price = input ? flexOptionalNumber(input.value) : null;
+  if (price === null || price < 0) { toast('اكتب سعر صحيح', 'err'); return; }
+  try {
+    await applyOrderMutation(`/api/orders/${currentOrder.order_id}/items/${itemId}/price`, 'PUT', {
+      actor: OPERATOR,
+      action_id: actionId('price-override'),
+      price,
+    }, 'تعذّر حفظ السعر الخاص.');
+    toast('اتحفظ السعر الخاص للسطر', 'ok');
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
+async function saveDiscount() {
+  if (!currentOrder || currentOrder.status === 'approved') return;
+  const input = document.getElementById('discountAmount');
+  const discount = input ? flexOptionalNumber(input.value) : null;
+  if (discount === null || discount < 0) { toast('اكتب خصم صحيح', 'err'); return; }
+  try {
+    await applyOrderMutation(`/api/orders/${currentOrder.order_id}/discount`, 'PUT', {
+      actor: OPERATOR,
+      action_id: actionId('discount'),
+      discount,
+    }, 'تعذّر حفظ الخصم.');
+    toast('اتحفظ الخصم على الطلب', 'ok');
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
+async function sendReview(itemId, payload) {
+  const response = await api(`/api/orders/${currentOrder.order_id}/items/${itemId}/review`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) throw new Error(await readError(response, 'تعذّر تسجيل القرار.'));
+  return response.json();
+}
+
+async function confirmRow(itemId, silent) {
+  const skuEl = document.getElementById(`sku-${itemId}`);
+  const qtyEl = document.getElementById(`qty-${itemId}`);
+  const unitEl = document.getElementById(`unit-${itemId}`);
+  const sku = skuEl ? skuEl.value : '';
+  const quantity = num(qtyEl ? qtyEl.value : 0, 0);
+  const unit = ((unitEl ? unitEl.value : '') || '').trim();
+
+  if (!sku) { if (!silent) toast('اختار الصنف الأول', 'err'); return false; }
+  if (!(quantity > 0)) { if (!silent) toast('الكمية لازم تكون أكبر من صفر', 'err'); return false; }
+  if (!unit) { if (!silent) toast('اكتب الوحدة', 'err'); return false; }
+
+  try {
+    currentOrder = await sendReview(itemId, {
+      actor: OPERATOR,
+      action_id: actionId('review'),
+      final_decision: 'SELECT',
+      selected_sku: sku,
+      quantity,
+      unit,
+    });
+    if (!silent) { render(); loadOrders(); toast('اتسجّل القرار', 'ok'); }
+    return true;
+  } catch (error) {
+    if (!silent) toast(error.message, 'err');
+    return false;
+  }
+}
+
+async function markNotFound(itemId) {
+  try {
+    currentOrder = await sendReview(itemId, {
+      actor: OPERATOR,
+      action_id: actionId('notfound'),
+      final_decision: 'NOT_FOUND',
+    });
+    render();
+    loadOrders();
+    toast('اتسجّل: غير موجود بالكتالوج', 'ok');
+  } catch (error) {
+    toast(error.message, 'err');
+  }
+}
+
+async function confirmAllRows() {
+  const button = document.getElementById('confirmAllBtn');
+  button.disabled = true;
+  button.innerHTML = '<span class="spinner"></span> جارٍ التأكيد';
+
+  // Only lines the matcher is unambiguously confident about are batch-confirmed.
+  // Ambiguous or low-confidence lines stay pre-filled but need an individual
+  // click, so a close size/pack variant can never be rubber-stamped in bulk.
+  const all = currentOrder.items.filter((i) => !i.is_human_confirmed && !flexIsExcluded(i));
+  const pending = all.filter((i) => i.recommendation_decision === 'SELECT');
+  const needsAttention = all.length - pending.length;
+  let done = 0;
+  let skipped = 0;
+  for (const item of pending) {
+    /* eslint-disable no-await-in-loop */
+    const ok = await confirmRow(item.id, true);
+    if (ok) { done += 1; } else { skipped += 1; }
+  }
+  render();
+  loadOrders();
+  button.disabled = false;
+  button.textContent = 'تأكيد السطور الأكيدة';
+  const remaining = skipped + needsAttention;
+  toast(
+    remaining ? `اتأكد ${done} سطر — فاضل ${remaining} محتاج مراجعة منك` : `اتأكد ${done} سطر`,
+    remaining ? 'info' : 'ok',
+  );
+}
+
+async function approveOrder() {
+  const button = document.getElementById('approveBtn');
+  button.disabled = true;
+  button.innerHTML = '<span class="spinner"></span> جارٍ الاعتماد';
+  try {
+    const response = await api(`/api/orders/${currentOrder.order_id}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ actor: OPERATOR, action_id: actionId('approve') }),
+    });
+    if (!response.ok) {
+      toast(await readError(response, 'تعذّر اعتماد الطلب.'), 'err');
+      button.disabled = false;
+      button.textContent = 'اعتماد الطلب';
+      return;
+    }
+    await openOrder(currentOrder.order_id);
+    toast('تم اعتماد الطلب', 'ok');
+    loadOrders();
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = 'اعتماد الطلب';
+  }
+}
+
+/* The formatted file: what an operator hands to a distributor owner. The CSV
+   below stays for whatever ingests a raw drop. Both bump export_count on the
+   server, so both refresh the history panel. */
+function exportXlsx() {
+  postDownload(`/api/orders/${currentOrder.order_id}/export.xlsx`);
+  setTimeout(loadOrders, 1200);
+}
+
+function exportCsv() {
+  postDownload(`/api/orders/${currentOrder.order_id}/export`);
+  setTimeout(loadOrders, 1200);
+}
+
+/* Exports create an audit event, so they are POSTs rather than state-changing
+   GETs. A temporary same-origin form keeps the browser's native download flow. */
+function postDownload(path) {
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = path;
+  form.style.display = 'none';
+  document.body.appendChild(form);
+  form.submit();
+  form.remove();
+}
+
+/* The merchant asked to download the document and deal with it themselves —
+   forward it, print it, save it as PDF — rather than be handed a print dialog. */
+function downloadDocument() {
+  window.location.href = `/api/orders/${currentOrder.order_id}/document`;
+}
+
+/* WhatsApp is the channel and WhatsApp takes images. The document opens in a
+   tab and converts itself; the conversion needs the network the first time,
+   and says so plainly if it cannot. */
+function downloadImage() {
+  const url = `/api/orders/${currentOrder.order_id}/document?inline=1#png`;
+  const tab = window.open(url, '_blank', 'noopener');
+  if (!tab) toast('اسمح بالنوافذ المنبثقة عشان نحوّل المستند لصورة', 'err');
+}
+
+/* ----------------------------- settings --------------------------- */
+
+let pendingLogo = null;   // null = keep what is stored, '' = remove it
+
+function toggleSettings() {
+  const panel = document.getElementById('settingsPanel');
+  panel.classList.toggle('hidden');
+  document.getElementById('settingsToggle').textContent =
+    panel.classList.contains('hidden') ? 'تعديل البيانات' : 'إخفاء';
+}
+
+function showLogo(dataUrl) {
+  const box = document.getElementById('logoPreviewBox');
+  box.innerHTML = dataUrl
+    ? `<img class="logo-preview" src="${esc(dataUrl)}" alt="شعار المحل">`
+    : '<div class="hint">مفيش شعار متخزّن.</div>';
+}
+
+async function loadSettings() {
+  try {
+    const response = await api('/api/settings');
+    if (!response.ok) return;
+    const s = await response.json();
+    document.getElementById('setShopName').value = s.shop_name || '';
+    document.getElementById('setShopAddress').value = s.shop_address || '';
+    document.getElementById('setShopPhone').value = s.shop_phone || '';
+    document.getElementById('setTaxId').value = s.tax_id || '';
+    document.getElementById('setDocTitle').value = s.document_title || 'إذن صرف';
+    document.getElementById('setFooterNote').value = s.footer_note || '';
+    pendingLogo = null;
+    showLogo(s.logo_data_url || '');
+    document.getElementById('settingsMeta').textContent =
+      s.shop_name ? s.shop_name : 'لسه مفيش اسم محل — المستند هيطلع من غير اسم';
+  } catch (error) { /* handled by api() */ }
+}
+
+function removeLogo() {
+  pendingLogo = '';
+  document.getElementById('logoFile').value = '';
+  showLogo('');
+  toast('هيتشال بعد الحفظ', 'info');
+}
+
+async function saveSettings() {
+  const button = document.getElementById('saveSettingsBtn');
+  const box = document.getElementById('settingsResult');
+  const name = document.getElementById('setShopName').value.trim();
+  const title = document.getElementById('setDocTitle').value.trim();
+  if (!name) { toast('اكتب اسم المحل', 'err'); return; }
+  if (!title) { toast('اكتب عنوان المستند', 'err'); return; }
+
+  button.disabled = true;
+  button.innerHTML = '<span class="spinner"></span> جارٍ الحفظ';
+  box.innerHTML = '';
+
+  const body = {
+    shop_name: name,
+    shop_address: document.getElementById('setShopAddress').value.trim(),
+    shop_phone: document.getElementById('setShopPhone').value.trim(),
+    tax_id: document.getElementById('setTaxId').value.trim(),
+    document_title: title,
+    footer_note: document.getElementById('setFooterNote').value.trim(),
+  };
+  // null means "leave the stored logo alone"; the field is only sent when the
+  // merchant actually picked a new file or asked to clear it.
+  if (pendingLogo !== null) body.logo_data_url = pendingLogo;
+  else body.logo_data_url = currentLogo();
+
+  try {
+    const response = await api('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      box.innerHTML = `<div class="banner err">⚠️ ${esc(await readError(response, 'تعذّر حفظ البيانات.'))}</div>`;
+    } else {
+      await loadSettings();
+      box.innerHTML = '<div class="banner ok">✅ اتحفظت بيانات المحل.</div>';
+      toast('اتحفظت بيانات المحل', 'ok');
+    }
+  } catch (error) {
+    box.innerHTML = '<div class="banner err">⚠️ تعذّر الاتصال بالخادم.</div>';
+  }
+  button.disabled = false;
+  button.textContent = 'حفظ البيانات';
+}
+
+function currentLogo() {
+  const img = document.querySelector('#logoPreviewBox img');
+  return img ? img.getAttribute('src') : '';
+}
+
+document.getElementById('logoFile').addEventListener('change', (event) => {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  if (!/^image\/(png|jpeg)$/.test(file.type)) {
+    toast('الشعار لازم يكون PNG أو JPG', 'err');
+    event.target.value = '';
+    return;
+  }
+  if (file.size > 500 * 1024) {
+    toast('حجم الشعار أكبر من ٥٠٠ كيلوبايت', 'err');
+    event.target.value = '';
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    pendingLogo = String(reader.result || '');
+    showLogo(pendingLogo);
+  };
+  reader.onerror = () => toast('تعذّر قراءة الملف', 'err');
+  reader.readAsDataURL(file);
+});
+
+/* ------------------------------ history --------------------------- */
+
+async function legacyLoadOrders() {
+  const tbody = document.getElementById('historyBody');
+  try {
+    const response = await api('/api/orders?limit=15');
+    if (!response.ok) { tbody.innerHTML = ''; return; }
+    const rows = await response.json();
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted)">لسه مفيش طلبات.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map((row) => {
+      const badge = row.status === 'approved'
+        ? '<span class="badge appr">معتمد</span>'
+        : ((row.confirmed_items >= row.total_items && row.total_items > 0)
+          ? '<span class="badge done">جاهز للاعتماد</span>'
+          : '<span class="badge pending">قيد المراجعة</span>');
+      const when = new Date(row.created_at).toLocaleString('ar-EG');
+      return `<tr onclick="openOrder(${esc(row.order_id)})">` +
+        `<td><strong>#${esc(row.order_id)}</strong></td>` +
+        `<td style="max-width:340px;color:var(--text-secondary)">${esc(row.original_text)}</td>` +
+        `<td>${esc(row.confirmed_items)} / ${esc(row.total_items)}</td>` +
+        `<td>${badge}</td>` +
+        `<td style="color:var(--text-muted);white-space:nowrap">${esc(when)}</td></tr>`;
+    }).join('');
+  } catch (error) { /* handled by api() */ }
+}
+
+async function loadOrders() {
+  const tbody = document.getElementById('historyBody');
+  const query = document.getElementById('historySearch').value.trim();
+  const params = new URLSearchParams({ limit: '15' });
+  if (query) params.set('search', query);
+  try {
+    const response = await api(`/api/orders?${params.toString()}`);
+    if (!response.ok) { tbody.innerHTML = ''; return; }
+    const rows = await response.json();
+    if (!rows.length) {
+      tbody.innerHTML = `<tr><td colspan="6" style="color:var(--text-muted)">${
+        query ? 'مفيش طلبات للبحث ده.' : 'لسه مفيش طلبات.'
+      }</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = rows.map((row) => {
+      const badge = row.status === 'approved'
+        ? '<span class="badge appr">مُعتمد</span>'
+        : ((row.confirmed_items >= row.total_items && row.total_items > 0)
+          ? '<span class="badge done">جاهز للاعتماد</span>'
+          : '<span class="badge pending">قيد المراجعة</span>');
+      const customer = row.customer_name || '—';
+      const phone = row.customer_phone ? `<div class="hint">${esc(row.customer_phone)}</div>` : '';
+      const address = row.customer_address ? `<div class="hint">${esc(row.customer_address)}</div>` : '';
+      const when = new Date(row.created_at).toLocaleString('ar-EG');
+      return `<tr data-order-id="${esc(row.order_id)}">` +
+        `<td><strong>#${esc(row.order_id)}</strong></td>` +
+        `<td>${esc(customer)}${phone}${address}</td>` +
+        `<td style="max-width:300px;color:var(--text-secondary)">${esc(row.original_text)}</td>` +
+        `<td>${esc(row.confirmed_items)} / ${esc(row.total_items)}</td>` +
+        `<td>${badge}</td>` +
+        `<td style="color:var(--text-muted);white-space:nowrap">${esc(when)}</td></tr>`;
+    }).join('');
+  } catch (error) { /* handled by api() */ }
+}
+
+/* -------------------------------- misc ---------------------------- */
+
+function clearAll() {
+  document.getElementById('orderInput').value = '';
+  document.getElementById('results').classList.add('hidden');
+  currentOrder = null;
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+async function logout() {
+  await fetch('/api/logout', { method: 'POST' });
+  window.location.href = '/login';
+}
+
+document.getElementById('samples').innerHTML =
+  SAMPLES.map((s, i) => `<button class="sample" data-i="${i}">${esc(s)}</button>`).join('');
+document.getElementById('samples').addEventListener('click', (event) => {
+  const button = event.target.closest('.sample');
+  if (!button) return;
+  document.getElementById('orderInput').value = SAMPLES[Number(button.dataset.i)];
+});
+
+// Combobox behaviour, fully delegated. Nothing user-controlled is ever placed
+// inside an inline event handler — ids and skus travel as data-* attributes.
+document.addEventListener('focusin', (e) => {
+  const box = e.target.closest('.combo input.q');
+  if (!box) return;
+  const id = box.dataset.item;
+  closeAllPanels(`pan-${id}`);
+  renderOptions(id, shortlistOf(id), 'ابدأ بالكتابة للبحث في الكتالوج');
+});
+document.addEventListener('input', (e) => {
+  const box = e.target.closest('.combo input.q');
+  if (box) { onComboInput(box.dataset.item, box.value); return; }
+  // Live order total: typing a quantity updates the line and the running sum
+  // without a round trip, so the merchant can quote a price on the phone.
+  if (e.target.id && (
+    e.target.id.startsWith('qty-') || e.target.id.startsWith('price-') || e.target.id === 'discountAmount'
+  )) flexRefreshTotals();
+});
+document.addEventListener('click', (e) => {
+  const opt = e.target.closest('.combo .opt');
+  if (opt) { pickProduct(opt.dataset.item, opt.dataset.sku, opt.dataset.name, opt.dataset.unit); return; }
+  if (!e.target.closest('.combo')) closeAllPanels();
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAllPanels(); });
+
+let historySearchTimer = null;
+document.getElementById('historySearch').addEventListener('input', () => {
+  clearTimeout(historySearchTimer);
+  historySearchTimer = setTimeout(loadOrders, 220);
+});
+document.getElementById('historySearch').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    clearTimeout(historySearchTimer);
+    loadOrders();
+  }
+});
+document.getElementById('historyBody').addEventListener('click', (event) => {
+  const row = event.target.closest('tr[data-order-id]');
+  if (!row) return;
+  const orderId = Number(row.dataset.orderId);
+  if (Number.isInteger(orderId) && orderId > 0) openOrder(orderId);
+});
+
+document.getElementById('orderInput').addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') processOrder();
+});
+
+loadCatalog();
+loadSettings();
+loadOrders();
+</script>
+</body>
+</html>

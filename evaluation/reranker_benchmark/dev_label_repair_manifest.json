@@ -1,0 +1,31 @@
+{
+  "manifest_type": "DEV_LABEL_REPAIR_MANIFEST",
+  "timestamp_utc": "2026-07-25T23:15:36.121541+00:00",
+  "target_file": "evaluation/reranker_benchmark/sealed/dev_labels.jsonl",
+  "before_sha256": "0eb69d2cf27ab744a2f17cb584726f9ee75d39922f305977691ac7e88bf3877b",
+  "after_sha256": "7fd087667f4efbd9194204bc4e21c660ed00ccd7956bbf71720198b52100d592",
+  "archived_original_file": "evaluation/reranker_benchmark/sealed/dev_labels_v1_archived.jsonl",
+  "repairs": [
+    {
+      "case_id": "55:144",
+      "previous_label": "CC001",
+      "corrected_label": "CC004",
+      "exact_source_evidence": "Query 'صابون اطباق ليمون الراعي 5 لتر' with quantity 5.0 جركن explicitly specifies 5 liters. CC004 is 'صابون سائل للأطباق برائحة الليمون ماركة الراعي 5 لتر' (جركن), whereas CC001 is 500 مل (زجاجة).",
+      "reason_for_correction": "Ground truth label mapped 5L jerrycan query to 500ml bottle SKU."
+    },
+    {
+      "case_id": "64:171",
+      "previous_label": "CC001",
+      "corrected_label": "CC004",
+      "exact_source_evidence": "Query 'صابون اطباق ليمون الراعي 5 لتر' with quantity 5.0 جركن explicitly specifies 5 liters. CC004 is 'صابون سائل للأطباق برائحة الليمون ماركة الراعي 5 لتر' (جركن), whereas CC001 is 500 مل (زجاجة).",
+      "reason_for_correction": "Ground truth label mapped 5L jerrycan query to 500ml bottle SKU."
+    },
+    {
+      "case_id": "90:256",
+      "previous_label": "CC001",
+      "corrected_label": "CC004",
+      "exact_source_evidence": "Query 'صابون سائل ليمون الراعي 5 لتر' with quantity 2.0 جركن explicitly specifies 5 liters. CC004 is 'صابون سائل للأطباق برائحة الليمون ماركة الراعي 5 لتر' (جركن), whereas CC001 is 500 مل (زجاجة).",
+      "reason_for_correction": "Ground truth label mapped 5L jerrycan query to 500ml bottle SKU."
+    }
+  ]
+}
