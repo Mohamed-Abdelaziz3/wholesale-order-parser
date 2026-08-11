@@ -56,10 +56,10 @@ EXTRACTION_PROMPT = """أنت نظام ذكي متخصص في تحليل طلب�
 2. حوّل الأرقام المكتوبة بالحروف (مثل: تلاته، خمسه، عشرين) إلى أرقام.
 3. حدد الوحدة من: كرتونة، رول، باكو، قطعة، دستة، جركن، لفة، كيس.
 4. إذا لم تُذكر الكمية صراحة، ضع 1.
-5. إذا لم تُذكر الوحدة، ضع "قطعة".
+5. إذا لم تُذكر الوحدة صراحةً، أرسل قيمة unit فارغة. لا تفترض "قطعة" أو أي وحدة أخرى.
 6. إذا ذُكر تصحيح للكمية (مثل: "10 لا خلي 7" أو "عشرة بس غيرها لخمسة")، استخدم الرقم المصحح فقط.
-7. "نص دستة" = 6 قطع.
-8. "دستة" = 12 قطعة.
+7. لا تحوّل الدستة أو نصف الدستة أو الكرتونة أو الباكو إلى قطع، ولا تخترع عامل تحويل.
+8. احتفظ بالوحدة التي كتبها العميل كما هي قدر الإمكان.
 9. حافظ على أبعاد المنتج إن وُجدت (مثل: 50 في 70، 70×100).
 10. حافظ على الحجم أو السعة أو الوزن إن وُجد (مثل: 500 مل، 1 لتر، 5 كيلو) داخل product_description، لأنه غالباً هو الفرق الوحيد بين أصناف متشابهة.
 11. إذا كان جزء من الرسالة غير مفهوم أو لا يتعلق بطلب منتج، ضعه في unresolved_text.
@@ -103,7 +103,9 @@ def _parse_json_response(text: str) -> dict:
         except json.JSONDecodeError:
             pass
 
-    raise ValueError(f"Could not parse JSON from the extraction response:\n{text[:500]}")
+    # Model output can echo the merchant's pasted WhatsApp text.  Keep the
+    # diagnostic deliberately content-free because callers log retry failures.
+    raise ValueError("Extraction provider returned invalid structured output")
 
 
 def _is_transient(error: BaseException) -> bool:
@@ -134,7 +136,10 @@ def _build_result(data: dict) -> ExtractionResult:
                 raw_text=str(raw_item.get("raw_text") or description).strip(),
                 product_description=description,
                 quantity=_coerce_quantity(raw_item.get("quantity", 1)),
-                unit=str(raw_item.get("unit") or "قطعة").strip() or "قطعة",
+                # Missing unit evidence remains missing. The reviewer must not
+                # be led to believe it was a piece merely because the model did
+                # not state a unit.
+                unit=str(raw_item.get("unit") or "").strip(),
             )
         )
 
@@ -230,22 +235,21 @@ class GeminiExtractor:
         for model in self.candidate_models:
             for attempt in range(self.max_attempts):
                 if time.monotonic() >= deadline:
-                    raise ExtractionUnavailable(
-                        f"Extraction deadline of {self.deadline_seconds:.0f}s exceeded. "
-                        f"Last error: {last_error}"
-                    ) from last_error
+                    # Provider exceptions and model output can contain the
+                    # prompt, so neither may be carried into a loggable error.
+                    raise ExtractionUnavailable("Extraction deadline exceeded") from last_error
                 try:
                     return _build_result(_parse_json_response(self._generate(model, prompt)))
                 except Exception as error:  # noqa: BLE001 - provider surface is broad
                     last_error = error
                     transient = _is_transient(error)
                     logger.warning(
-                        "Extraction attempt %s/%s on %s failed (%s): %s",
+                        "Extraction attempt %s/%s on %s failed (%s; error_type=%s)",
                         attempt + 1,
                         self.max_attempts,
                         model,
                         "transient" if transient else "permanent",
-                        error,
+                        type(error).__name__,
                     )
                     if not transient:
                         break  # try the next model rather than hammering this one
@@ -255,9 +259,7 @@ class GeminiExtractor:
                             break
                         self._sleep_for(attempt, remaining)
 
-        raise ExtractionUnavailable(
-            f"All extraction models failed. Last error: {last_error}"
-        ) from last_error
+        raise ExtractionUnavailable("All extraction models failed") from last_error
 
 
 class MockExtractor:
@@ -292,7 +294,7 @@ class MockExtractor:
                         raw_text=match.group(0).strip(),
                         product_description=product,
                         quantity=float(match.group(1)),
-                        unit=match.group(2) or "قطعة",
+                        unit=(match.group(2) or "").strip(),
                     )
                 )
         return ExtractionResult(items=items, unresolved_text=[])

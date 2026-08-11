@@ -22,7 +22,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
-from dotenv import load_dotenv
 from fastapi import (
     APIRouter,
     Depends,
@@ -71,7 +70,9 @@ from .models import (
     ShopSettingsRequest,
     TimeSavedEstimate,
 )
+from .money import ZERO, api_money, from_storage, line_total, money_sum, to_storage
 from .routing import route_rr_k_outcome, rr_k_auto_accept_enabled
+from .runtime_config import load_runtime_environment, validate_production_configuration
 from .security import (
     SESSION_ISSUED_AT_KEY,
     SESSION_OPERATOR_KEY,
@@ -88,14 +89,18 @@ from .security import (
     sanitize_logo_data_url,
     session_operator,
 )
+from .units import (
+    UNIT_CHECK_LEGACY_APPROVED,
+    UNIT_CHECK_PENDING,
+    unit_check_is_approval_ready,
+    unit_check_requires_resolution,
+)
 from .xlsx_export import build_order_workbook, export_date, filename_stem
 
-# Keep local secrets and the runtime database outside synced project folders.
-# Fall back to the conventional working-directory .env for deployments that
-# provide their configuration through the project environment.
-load_dotenv()
-if os.name == "nt":
-    load_dotenv(r"C:\ProgramData\wop\.env")
+# ``database`` has already loaded this before it resolves DB_PATH. Repeating it
+# here is idempotent and keeps direct app imports on the same explicit
+# machine-local configuration policy without ever searching cwd for `.env`.
+load_runtime_environment()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
@@ -111,6 +116,8 @@ APP_VERSION = "3.0.0"
 
 MANUAL_ENTRY_SECONDS_PER_ITEM = 45.0
 MAX_CATALOG_UPLOAD_BYTES = 8 * 1024 * 1024
+PROCESS_REQUEST_WAIT_SECONDS = 55.0
+PROCESS_REQUEST_POLL_SECONDS = 0.05
 
 # Module-level extractor so tests can monkeypatch ``app.main.extractor`` before
 # startup. Startup only creates one when none has been injected.
@@ -257,7 +264,7 @@ def _format_order_response(order_data: dict, lookup: dict[str, CatalogProduct]) 
     """
     items: list[OrderLineResult] = []
     total_confirmed = 0
-    subtotal = 0.0
+    provisional_line_totals = []
     active_items = 0
 
     snapshot_by_item = {
@@ -266,6 +273,40 @@ def _format_order_response(order_data: dict, lookup: dict[str, CatalogProduct]) 
 
     for item_row in order_data.get("items", []):
         frozen = snapshot_by_item.get(item_row.get("id"))
+        requested_unit = item_row.get("requested_unit")
+        if requested_unit is None:
+            # Historical rows predate the dedicated request-evidence column.
+            # They remain readable without treating old overwritten values as
+            # enough evidence for a new commercial approval.
+            requested_unit = item_row.get("extracted_unit") or ""
+        unit_check_status = (
+            (frozen.get("unit_check_status") or UNIT_CHECK_LEGACY_APPROVED)
+            if frozen
+            else (item_row.get("unit_check_status") or UNIT_CHECK_PENDING)
+        )
+        catalog_unit = (
+            (frozen.get("catalog_unit") or frozen.get("unit"))
+            if frozen
+            else (item_row.get("matched_unit") or item_row.get("recommendation_unit"))
+        )
+        final_quantity = frozen.get("quantity") if frozen else item_row.get("final_quantity")
+        final_unit = frozen.get("unit") if frozen else item_row.get("final_unit")
+        unit_ready = bool(frozen) or unit_check_is_approval_ready(unit_check_status)
+        requires_unit_resolution = bool(
+            not frozen
+            # A reviewer can safely resolve a line by marking it NOT_FOUND:
+            # no commercial quantity, unit, or price is then approved. Keep a
+            # prior extracted mismatch as provenance, but do not present it as
+            # an unresolved commercial calculation or block the order.
+            and item_row.get("human_decision") not in {"NOT_FOUND", "CANCELLED"}
+            and (
+                unit_check_requires_resolution(unit_check_status)
+                or (
+                    item_row.get("human_decision") == "SELECT"
+                    and not unit_check_is_approval_ready(unit_check_status)
+                )
+            )
+        )
         catalog_price = (
             frozen.get("catalog_price") if frozen else item_row.get("catalog_price")
         )
@@ -286,26 +327,27 @@ def _format_order_response(order_data: dict, lookup: dict[str, CatalogProduct]) 
                 product_name=frozen["product_name"],
                 aliases=[],
                 unit=frozen["unit"],
-                price=float(frozen.get("price") or 0.0),
+                price=from_storage(frozen.get("price") or "0.00", "Snapshot price"),
             )
         elif item_row.get("matched_product_id"):
             # Keep the reviewed catalog baseline stable while the order is
             # mutable. A later catalog refresh must not replace a human price.
             effective_price = (
-                float(price_override)
-                if price_override is not None
-                else float(
-                    item_row.get("matched_price")
+                from_storage(
+                    price_override
+                    if price_override is not None
+                    else item_row.get("matched_price")
                     if item_row.get("matched_price") is not None
                     else catalog_price
-                    or 0.0
+                    or "0.00",
+                    "Effective catalog price",
                 )
             )
             matched_prod = CatalogProduct(
                 product_id=item_row["matched_product_id"],
                 product_name=item_row.get("matched_product_name") or "",
                 aliases=[],
-                unit=item_row.get("matched_unit") or item_row.get("extracted_unit") or "",
+                unit=final_unit or item_row.get("matched_unit") or "",
                 price=effective_price,
             )
         else:
@@ -318,7 +360,7 @@ def _format_order_response(order_data: dict, lookup: dict[str, CatalogProduct]) 
                 product_name=c.get("product_name", ""),
                 score=max(0.0, min(1.0, float(c.get("score", 0.0) or 0.0))),
                 unit=c.get("unit", "") or "",
-                price=float(c.get("price", 0.0) or 0.0),
+                price=from_storage(c.get("price", "0.00"), "Catalog candidate price"),
             )
             for c in item_row.get("candidates", [])
             if c.get("product_id")
@@ -327,21 +369,49 @@ def _format_order_response(order_data: dict, lookup: dict[str, CatalogProduct]) 
         is_cancelled = item_row.get("status") == "cancelled_by_human"
         if not is_cancelled:
             active_items += 1
-        if not is_cancelled and item_row.get("is_human_confirmed"):
+        if (
+            not is_cancelled
+            and item_row.get("is_human_confirmed")
+            and (
+                item_row.get("human_decision") != "SELECT"
+                or unit_ready
+            )
+        ):
             total_confirmed += 1
 
         # A recommendation is an estimate while review is pending. Cancelled
         # and confirmed-NOT_FOUND lines never contribute; a human price override
         # wins as soon as a line has been selected.
-        if not is_cancelled and item_row.get("status") != "not_found_confirmed":
+        commercial_line_ready = bool(frozen) or (
+            item_row.get("status") == "human_selected" and unit_ready
+        )
+        current_line_total = None
+        if (
+            not is_cancelled
+            and item_row.get("status") != "not_found_confirmed"
+            and commercial_line_ready
+        ):
             display_price = (
-                matched_prod.price if matched_prod else (recommended_prod.price if recommended_prod else None)
+                frozen.get("price")
+                if frozen
+                else price_override
+                if price_override is not None
+                else item_row.get("matched_price")
+                if item_row.get("matched_price") is not None
+                else catalog_price
+                if matched_prod
+                else recommended_prod.price
+                if recommended_prod
+                else None
             )
             if display_price is not None:
                 try:
-                    subtotal += round(
-                        float(display_price) * float(item_row.get("extracted_quantity") or 0), 2
+                    exact_line_total = line_total(
+                        display_price,
+                        final_quantity if final_quantity is not None else item_row.get("extracted_quantity") or 0,
                     )
+                    provisional_line_totals.append(exact_line_total)
+                    current_line_total = api_money(exact_line_total)
                 except (TypeError, ValueError):
                     pass
 
@@ -351,6 +421,20 @@ def _format_order_response(order_data: dict, lookup: dict[str, CatalogProduct]) 
                 raw_text=item_row.get("raw_text", ""),
                 extracted_product=item_row.get("extracted_product", ""),
                 extracted_quantity=item_row.get("extracted_quantity", 1.0),
+                requested_unit=requested_unit,
+                final_quantity=final_quantity,
+                final_unit=final_unit,
+                catalog_unit=catalog_unit,
+                unit_check_status=unit_check_status,
+                unit_resolution=(
+                    frozen.get("unit_resolution") if frozen else item_row.get("unit_resolution")
+                ),
+                unit_resolution_note=(
+                    frozen.get("unit_resolution_note")
+                    if frozen
+                    else item_row.get("unit_resolution_note")
+                ),
+                requires_unit_resolution=requires_unit_resolution,
                 extracted_unit=item_row.get("extracted_unit", "قطعة"),
                 matched_product=matched_prod,
                 recommended_product=recommended_prod,
@@ -363,7 +447,9 @@ def _format_order_response(order_data: dict, lookup: dict[str, CatalogProduct]) 
                 confidence=item_row.get("confidence", 0.0),
                 status=item_row.get("status", "needs_review"),
                 reason=(
-                    None
+                    "Customer-requested unit and catalog unit require an explicit human override"
+                    if requires_unit_resolution
+                    else None
                     if item_row.get("status")
                     in {"human_selected", "not_found_confirmed", "cancelled_by_human"}
                     else "يحتاج مراجعة أو مطابقة"
@@ -377,9 +463,10 @@ def _format_order_response(order_data: dict, lookup: dict[str, CatalogProduct]) 
                 human_actor=item_row.get("human_actor"),
                 human_confirmed_at=item_row.get("human_confirmed_at"),
                 review_action_id=item_row.get("review_action_id"),
-                catalog_price=(float(catalog_price) if catalog_price is not None else None),
-                price_override=(float(price_override) if price_override is not None else None),
+                catalog_price=(api_money(catalog_price) if catalog_price is not None else None),
+                price_override=(api_money(price_override) if price_override is not None else None),
                 price_overridden=price_overridden,
+                line_total=current_line_total,
                 is_manual_line=is_manual_line,
             )
         )
@@ -390,16 +477,28 @@ def _format_order_response(order_data: dict, lookup: dict[str, CatalogProduct]) 
         snapshot_item["is_manual_line"] = bool(snapshot_item.get("is_manual_line")) or (
             snapshot_item.get("model_decision") == "MANUAL"
         )
+        if snapshot_item.get("line_total") is not None:
+            snapshot_item["line_total"] = api_money(snapshot_item["line_total"])
         approved_snapshots.append(ApprovedSnapshotItem(**snapshot_item))
 
-    subtotal = round(subtotal, 2)
+    provisional_subtotal = money_sum(provisional_line_totals)
+    frozen_subtotal = order_data.get("approved_subtotal")
     frozen_discount = order_data.get("approved_discount")
-    discount = float(
-        frozen_discount
-        if order_data.get("status") == "approved" and frozen_discount is not None
-        else order_data.get("discount") or 0.0
+    is_approved = order_data.get("status") == "approved"
+    subtotal_decimal = (
+        from_storage(frozen_subtotal, "Approved subtotal")
+        if is_approved and frozen_subtotal is not None
+        else provisional_subtotal
     )
-    grand_total = round(max(0.0, subtotal - discount), 2)
+    discount_decimal = from_storage(
+        frozen_discount if is_approved and frozen_discount is not None else order_data.get("discount") or "0.00",
+        "Discount",
+    )
+    grand_total_decimal = (
+        from_storage(order_data.get("approved_grand_total"), "Approved grand total")
+        if is_approved and order_data.get("approved_grand_total") is not None
+        else max(ZERO, subtotal_decimal - discount_decimal)
+    )
 
     return OrderResult(
         order_id=order_data.get("id"),
@@ -420,10 +519,72 @@ def _format_order_response(order_data: dict, lookup: dict[str, CatalogProduct]) 
         customer_name=order_data.get("customer_name"),
         customer_phone=order_data.get("customer_phone"),
         customer_address=order_data.get("customer_address"),
-        discount=discount,
-        subtotal=subtotal,
-        grand_total=grand_total,
+        discount=api_money(discount_decimal),
+        subtotal=api_money(subtotal_decimal),
+        grand_total=api_money(grand_total_decimal),
     )
+
+
+def _completed_process_response(
+    *,
+    action_id: str,
+    operator: str,
+    message: str,
+    db_path: str,
+    lookup: dict[str, CatalogProduct],
+) -> Optional[OrderResult]:
+    """Return the one persisted result for an exact completed process request."""
+    record = database.get_process_request(
+        action_id,
+        actor=operator,
+        message=message,
+        db_path=db_path,
+    )
+    if not record or record.get("state") != "succeeded":
+        return None
+    order_id = record.get("order_id")
+    if order_id is None:
+        raise _server_error("Completed process request has no order", RuntimeError(action_id))
+    saved_order = database.get_order_by_id(int(order_id), db_path)
+    if not saved_order:
+        raise _server_error("Completed process order could not be reloaded", RuntimeError(str(order_id)))
+    return _format_order_response(saved_order, lookup)
+
+
+def _wait_for_completed_process_response(
+    *,
+    action_id: str,
+    operator: str,
+    message: str,
+    db_path: str,
+    lookup: dict[str, CatalogProduct],
+) -> Optional[OrderResult]:
+    """Wait briefly for the durable owner of the same request to finish.
+
+    This runs only in FastAPI's sync worker thread. It never invokes Gemini or
+    writes an order, so concurrent browser retries remain one logical command.
+    """
+    deadline = time.monotonic() + PROCESS_REQUEST_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        completed = _completed_process_response(
+            action_id=action_id,
+            operator=operator,
+            message=message,
+            db_path=db_path,
+            lookup=lookup,
+        )
+        if completed is not None:
+            return completed
+        record = database.get_process_request(
+            action_id,
+            actor=operator,
+            message=message,
+            db_path=db_path,
+        )
+        if record and record.get("state") == "failed":
+            return None
+        time.sleep(PROCESS_REQUEST_POLL_SECONDS)
+    return None
 
 
 def _server_error(context: str, error: BaseException) -> HTTPException:
@@ -562,18 +723,86 @@ def process_order(
     if not message:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="الرسالة فارغة")
 
+    try:
+        claim = database.begin_process_request(
+            order.action_id,
+            actor=operator,
+            message=message,
+            db_path=db_path,
+        )
+    except database.ProcessRequestConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="مفتاح إعادة المحاولة مستخدم لطلب مختلف. ابدأ طلباً جديداً.",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    if claim["outcome"] == "succeeded":
+        completed = _completed_process_response(
+            action_id=order.action_id,
+            operator=operator,
+            message=message,
+            db_path=db_path,
+            lookup=state.lookup,
+        )
+        if completed is not None:
+            return completed
+        raise _server_error("Completed process request was inconsistent", RuntimeError(order.action_id))
+
+    if claim["outcome"] == "in_progress":
+        completed = _wait_for_completed_process_response(
+            action_id=order.action_id,
+            operator=operator,
+            message=message,
+            db_path=db_path,
+            lookup=state.lookup,
+        )
+        if completed is not None:
+            return completed
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="الطلب ما زال قيد التحليل. أعد المحاولة بنفس المفتاح بعد لحظات.",
+            headers={"Retry-After": "2"},
+        )
+
     start_time = time.monotonic()
 
     try:
         extraction = extractor.extract(message)
     except ExtractionUnavailable as exc:
-        logger.error("Extraction provider unavailable: %s", exc)
+        database.fail_process_request(
+            order.action_id,
+            actor=operator,
+            message=message,
+            claim_token=claim["claim_token"],
+            failure_code="extractor_unavailable",
+            db_path=db_path,
+        )
+        # Do not log provider exception text here: SDK failures can include a
+        # response body that echoes the pasted customer message.
+        logger.error("Extraction provider unavailable (error_type=%s)", type(exc).__name__)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="خدمة الاستخراج غير متاحة مؤقتاً. حاول تاني بعد شوية.",
         ) from exc
     except Exception as exc:  # noqa: BLE001
-        raise _server_error("Extraction failed", exc) from exc
+        database.fail_process_request(
+            order.action_id,
+            actor=operator,
+            message=message,
+            claim_token=claim["claim_token"],
+            failure_code="extractor_error",
+            db_path=db_path,
+        )
+        # Keep extraction diagnostics content-free for the same reason as the
+        # expected-unavailable path above. Other endpoint failures retain the
+        # normal server diagnostic treatment.
+        logger.error("Extraction failed (error_type=%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="خدمة الاستخراج غير متاحة مؤقتاً. حاول تاني بعد شوية.",
+        ) from exc
 
     matcher = state.matcher
     items_data = []
@@ -597,7 +826,9 @@ def process_order(
                 "product_name": alt.product_name,
                 "score": alt.score,
                 "unit": alt.unit,
-                "price": alt.price,
+                # Persist the canonical text value. Decimal must not cross a
+                # JSON boundary through a binary float before database storage.
+                "price": to_storage(alt.price),
             }
             for alt in res.alternatives
         ]
@@ -608,7 +839,7 @@ def process_order(
                 "product_id": res.matched_product.product_id,
                 "product_name": res.matched_product.product_name,
                 "unit": res.matched_product.unit,
-                "price": res.matched_product.price,
+                "price": to_storage(res.matched_product.price),
             }
             if not any(c["product_id"] == recommendation_dict["product_id"] for c in candidates):
                 candidates.insert(0, {**recommendation_dict, "score": res.confidence})
@@ -632,15 +863,46 @@ def process_order(
     processing_time_ms = round((time.monotonic() - start_time) * 1000.0, 2)
 
     try:
-        order_id = database.save_processed_order(
-            original_text=message,
+        order_id = database.complete_process_request(
+            order.action_id,
+            actor=operator,
+            message=message,
+            claim_token=claim["claim_token"],
             items_data=items_data,
             unresolved_text=extraction.unresolved_text,
             processing_time_ms=processing_time_ms,
             db_path=db_path,
         )
         saved_order = database.get_order_by_id(order_id, db_path)
+    except database.ProcessRequestInProgress:
+        completed = _wait_for_completed_process_response(
+            action_id=order.action_id,
+            operator=operator,
+            message=message,
+            db_path=db_path,
+            lookup=state.lookup,
+        )
+        if completed is not None:
+            return completed
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="الطلب ما زال قيد التحليل. أعد المحاولة بنفس المفتاح بعد لحظات.",
+            headers={"Retry-After": "2"},
+        ) from None
+    except database.ProcessRequestConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="مفتاح إعادة المحاولة مستخدم لطلب مختلف. ابدأ طلباً جديداً.",
+        ) from exc
     except Exception as exc:  # noqa: BLE001
+        database.fail_process_request(
+            order.action_id,
+            actor=operator,
+            message=message,
+            claim_token=claim["claim_token"],
+            failure_code="persistence_error",
+            db_path=db_path,
+        )
         raise _server_error("Failed to persist order", exc) from exc
 
     if not saved_order:
@@ -859,6 +1121,8 @@ def update_item(
             selected_sku=update_req.selected_sku,
             quantity=update_req.quantity,
             unit=update_req.unit,
+            unit_resolution=update_req.unit_resolution,
+            unit_resolution_note=update_req.unit_resolution_note,
             catalog_lookup=state.lookup,
             db_path=db_path,
         )
@@ -983,12 +1247,17 @@ def export_order_csv(
         ]
     )
 
-    order_total = 0.0
+    frozen_line_totals = []
     for index, item in enumerate(export_data["snapshot"], start=1):
-        price = float(item.get("price", 0.0) or 0.0)
-        qty = float(item.get("quantity", 0.0) or 0.0)
-        line_total = round(price * qty, 2)
-        order_total += line_total
+        price = from_storage(item.get("price") or "0.00", "Snapshot price")
+        qty = item.get("quantity", 0.0)
+        frozen_total = item.get("line_total")
+        item_total = (
+            from_storage(frozen_total, "Snapshot line total")
+            if frozen_total not in (None, "")
+            else line_total(price, qty)
+        )
+        frozen_line_totals.append(item_total)
         writer.writerow(
             [
                 index,
@@ -996,8 +1265,8 @@ def export_order_csv(
                 csv_safe(item.get("product_name", "")),
                 csv_safe(qty),
                 csv_safe(item.get("unit", "")),
-                csv_safe(price),
-                csv_safe(line_total),
+                csv_safe(f"{price:.2f}"),
+                csv_safe(f"{item_total:.2f}"),
                 csv_safe(f"{float(item.get('confidence', 0.0) or 0.0):.0%}"),
                 "yes" if item.get("is_human_confirmed") else "no",
                 csv_safe(item.get("human_actor", "")),
@@ -1007,11 +1276,12 @@ def export_order_csv(
             ]
         )
 
-    discount = float(export_data.get("discount") or 0.0)
+    order_total = money_sum(frozen_line_totals)
+    discount = from_storage(export_data.get("discount") or "0.00", "Discount")
     try:
-        grand_total = round(float(export_data.get("grand_total")), 2)
+        grand_total = from_storage(export_data.get("grand_total"), "Grand total")
     except (TypeError, ValueError):
-        grand_total = round(max(0.0, round(order_total, 2) - discount), 2)
+        grand_total = max(ZERO, order_total - discount)
     writer.writerow([])
     writer.writerow(["", "", "الإجمالي قبل الخصم", "", "", "", csv_safe(round(order_total, 2))])
     writer.writerow(["", "", "الخصم", "", "", "", csv_safe(discount)])
@@ -1211,7 +1481,9 @@ def get_catalog(request: Request, _operator: str = Depends(require_operator)):
             "product_name": p.product_name,
             "aliases": p.aliases,
             "unit": p.unit,
-            "price": p.price,
+            # Explicit JSON presentation boundary; catalog/matcher state stays
+            # Decimal and never uses a float in commercial logic.
+            "price": api_money(p.price, "Catalog price"),
         }
         for p in _catalog_state(request).products
     ]
@@ -1259,7 +1531,7 @@ def search_catalog(
             "product_id": p.product_id,
             "product_name": p.product_name,
             "unit": p.unit,
-            "price": p.price,
+            "price": api_money(p.price, "Catalog price"),
             "score": 1.0,
         }
         for p in by_code
@@ -1274,7 +1546,7 @@ def search_catalog(
                 "product_id": candidate.product_id,
                 "product_name": candidate.product_name,
                 "unit": candidate.unit,
-                "price": candidate.price,
+                "price": api_money(candidate.price, "Catalog price"),
                 "score": candidate.score,
             }
         )
@@ -1318,7 +1590,18 @@ def upload_catalog(
     try:
         parsed = parse_catalog_bytes(raw, file.filename or "catalog.csv")
     except CatalogError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        # Keep a readable ``detail`` for existing API clients while returning
+        # the bounded import evidence the operator needs to correct the file.
+        # Nothing has reached the destructive replacement path at this point.
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={
+                "detail": str(exc),
+                "detected_column_mapping": exc.detected_column_mapping,
+                "unmapped_source_columns": exc.unmapped_source_columns,
+                "diagnostics": exc.diagnostics.model_dump(mode="json"),
+            },
+        )
     except Exception as exc:  # noqa: BLE001
         raise _server_error("Catalog parsing failed", exc) from exc
 
@@ -1345,6 +1628,9 @@ def upload_catalog(
         detected_encoding=parsed.detected_encoding,
         source_format=parsed.source_format,
         warnings=parsed.warnings,
+        detected_column_mapping=parsed.detected_column_mapping,
+        unmapped_source_columns=parsed.unmapped_source_columns,
+        diagnostics=parsed.diagnostics,
     )
 
 
@@ -1355,6 +1641,11 @@ def upload_catalog(
 
 def create_app(db_path: database.DatabasePath | None = None) -> FastAPI:
     """Build an application instance bound to exactly one database."""
+    resolved_db_path = database.resolve_db_path(db_path)
+    # Do this before authentication fallback generation or lifespan startup.
+    # A production Railway process must never serve from an ephemeral DB or
+    # unknown session secret, even briefly.
+    validate_production_configuration(db_path=resolved_db_path)
     auth_config = load_auth_config()
 
     @asynccontextmanager
@@ -1391,7 +1682,7 @@ def create_app(db_path: database.DatabasePath | None = None) -> FastAPI:
         redoc_url="/redoc" if expose_docs else None,
         openapi_url="/openapi.json" if expose_docs else None,
     )
-    application.state.database_path = database.resolve_db_path(db_path)
+    application.state.database_path = resolved_db_path
     application.state.auth_config = auth_config
     application.state.catalog_state = CatalogState()
     application.state.login_throttle = LoginThrottle()

@@ -38,8 +38,8 @@ jobs:
       - name: Lint
         run: ruff check app tests serve_demo.py
 
-      - name: Test offline suite
-        run: pytest --ignore=tests/test_live_gemini.py
+      - name: Test suite
+        run: pytest
 
       - name: Audit dependencies
         run: pip-audit -r requirements.txt

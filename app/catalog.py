@@ -13,10 +13,12 @@ import io
 import os
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from .models import CatalogProduct
+from .models import CatalogImportDiagnostics, CatalogProduct, CatalogRowDiagnostic
+from .money import parse_money
 
 DEFAULT_CATALOG_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -25,6 +27,7 @@ DEFAULT_CATALOG_PATH = os.path.join(
 
 MAX_CATALOG_ROWS = 50_000
 MAX_ALIASES_PER_PRODUCT = 40
+MAX_DIAGNOSTIC_EXAMPLES = 25
 
 # Encodings an Egyptian merchant's Excel export realistically arrives in.
 # Excel's "Unicode Text (*.txt)" export is UTF-16LE with a BOM; Arabic Windows
@@ -60,7 +63,25 @@ _ARABIC_INDIC = str.maketrans("٠١٢٣٤٥٦٧٨٩٫", "0123456789.")
 
 
 class CatalogError(ValueError):
-    """Raised when an uploaded catalog cannot be accepted."""
+    """Raised when an uploaded catalog cannot be accepted safely.
+
+    The normal error string is readable in a browser or CLI. The structured
+    fields give the API enough evidence to show exactly which source rows need
+    repair without installing a partial catalog.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostics: CatalogImportDiagnostics | None = None,
+        detected_column_mapping: dict[str, str] | None = None,
+        unmapped_source_columns: list[str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics or CatalogImportDiagnostics()
+        self.detected_column_mapping = detected_column_mapping or {}
+        self.unmapped_source_columns = unmapped_source_columns or []
 
 
 @dataclass
@@ -71,6 +92,9 @@ class CatalogParseResult:
     warnings: list[str] = field(default_factory=list)
     detected_encoding: str = ""
     source_format: str = "csv"
+    detected_column_mapping: dict[str, str] = field(default_factory=dict)
+    unmapped_source_columns: list[str] = field(default_factory=list)
+    diagnostics: CatalogImportDiagnostics = field(default_factory=CatalogImportDiagnostics)
 
     @property
     def count(self) -> int:
@@ -91,6 +115,69 @@ def _resolve_columns(headers: Sequence[str]) -> dict[str, str]:
                 resolved[canonical] = normalised[option]
                 break
     return resolved
+
+
+def _unmapped_columns(headers: Sequence[str], columns: dict[str, str]) -> list[str]:
+    """Return source headers deliberately not used by this importer.
+
+    Unknown columns are not guessed at or silently mapped. They are harmless
+    for a merchant export, but surfaced so an operator can verify the detected
+    mapping before relying on the newly installed catalog.
+    """
+    selected = set(columns.values())
+    return [header for header in headers if header and header not in selected]
+
+
+def _row_example(
+    diagnostics: CatalogImportDiagnostics,
+    *,
+    line_number: int,
+    issues: list[str],
+    product_id: str | None,
+) -> None:
+    """Add an operator example without letting a bad upload flood a response."""
+    if len(diagnostics.malformed_row_examples) >= MAX_DIAGNOSTIC_EXAMPLES:
+        return
+    diagnostics.malformed_row_examples.append(
+        CatalogRowDiagnostic(
+            line_number=line_number,
+            product_id=product_id or None,
+            issues=issues,
+        )
+    )
+
+
+def _validation_error_message(diagnostics: CatalogImportDiagnostics) -> str:
+    """Summarise every blocking condition in a concise bilingual message."""
+    facts: list[str] = []
+    if diagnostics.row_limit_exceeded:
+        facts.append(f"row limit exceeded / تجاوز الحد الأقصى {MAX_CATALOG_ROWS} صف")
+    if diagnostics.malformed_row_count:
+        facts.append(
+            f"malformed rows / صفوف غير صالحة: {diagnostics.malformed_row_count}"
+        )
+    if diagnostics.duplicate_sku_count:
+        facts.append(
+            f"duplicate SKU rows / أكواد مكررة: {diagnostics.duplicate_sku_count}"
+        )
+    if diagnostics.missing_sku_count:
+        facts.append(f"missing SKU / كود مفقود: {diagnostics.missing_sku_count}")
+    if diagnostics.missing_name_count:
+        facts.append(f"missing name / اسم مفقود: {diagnostics.missing_name_count}")
+    if diagnostics.missing_price_count:
+        facts.append(f"missing price / سعر مفقود: {diagnostics.missing_price_count}")
+    if diagnostics.invalid_price_count:
+        facts.append(
+            f"invalid price / سعر غير صالح: {diagnostics.invalid_price_count}"
+        )
+    if diagnostics.missing_unit_count:
+        facts.append(f"missing unit / وحدة مفقودة: {diagnostics.missing_unit_count}")
+    summary = "; ".join(facts) or "catalog validation failed / فشل التحقق من الكتالوج"
+    return (
+        "Catalog was not installed; fix the listed source rows and upload again. "
+        "لم يتم استبدال الكتالوج؛ صحح الصفوف المذكورة ثم ارفع الملف مرة أخرى. "
+        f"Details: {summary}."
+    )
 
 
 def _has_arabic(text: str) -> bool:
@@ -117,19 +204,47 @@ def _decode(raw: bytes) -> tuple[str, str]:
     return raw.decode("utf-8", errors="replace"), "utf-8 (with replacements)"
 
 
-def _clean_price(value: object) -> float:
+class _CatalogPriceError(ValueError):
+    """A price-cell failure classified for catalog diagnostics."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+_PRICE_PATTERN = re.compile(r"^(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?$")
+
+
+def _parse_catalog_price(value: object) -> Decimal:
+    """Read one explicit catalog price without guessing or repairing it.
+
+    Currency symbols, loose text, excess decimals, negative numbers, and
+    malformed grouping are all rejected. Arabic digits and the Arabic decimal
+    and thousands separators are deterministic spelling equivalents, so they
+    are normalised before validation. A numeric zero remains valid: "free" is
+    a commercial decision, whereas a missing price is not.
+    """
     if value is None:
-        return 0.0
+        raise _CatalogPriceError("missing_price", "price is blank")
+    if isinstance(value, bool):
+        raise _CatalogPriceError("invalid_price", "price is not a number")
+
     text = str(value).translate(_ARABIC_INDIC).strip()
     if not text:
-        return 0.0
-    text = re.sub(r"[^\d.\-]", "", text.replace(",", ""))
-    if not text or text in {"-", ".", "-."}:
-        return 0.0
+        raise _CatalogPriceError("missing_price", "price is blank")
+    text = text.replace("\u066b", ".").replace("\u066c", ",")
+    if text.startswith("-"):
+        raise _CatalogPriceError("invalid_price", "price must not be negative")
+    if not _PRICE_PATTERN.fullmatch(text):
+        raise _CatalogPriceError(
+            "invalid_price",
+            "price must be a non-negative number with at most two decimal places",
+        )
     try:
-        return round(abs(float(text)), 4)
-    except ValueError:
-        return 0.0
+        # Thousands separators have already been proven structurally valid.
+        return parse_money(text.replace(",", ""), "Catalog price")
+    except ValueError as exc:
+        raise _CatalogPriceError("invalid_price", str(exc)) from None
 
 
 def _split_aliases(value: object) -> list[str]:
@@ -201,78 +316,140 @@ def parse_catalog_bytes(raw: bytes, filename: str = "catalog.csv") -> CatalogPar
         body = reader
 
     columns = _resolve_columns(headers)
-    missing = [f for f in ("product_id", "product_name") if f not in columns]
+    unmapped_columns = _unmapped_columns(headers, columns)
+    result.detected_column_mapping = dict(columns)
+    result.unmapped_source_columns = unmapped_columns
+
+    # Price is commercial authority from the catalog, so it is just as
+    # required as the SKU, product name, and unit. Never manufacture a zero
+    # price because a merchant omitted a column.
+    required_columns = ("product_id", "product_name", "unit", "price")
+    missing = [field for field in required_columns if field not in columns]
     if missing:
-        present = ", ".join(h for h in headers if h) or "(بدون عناوين)"
+        result.diagnostics.missing_required_columns = list(missing)
+        present = ", ".join(header for header in headers if header) or "(no headers / بدون عناوين)"
+        missing_names = ", ".join(missing)
         raise CatalogError(
-            "الملف لازم يحتوي على عمود للكود وعمود لاسم المنتج. "
-            f"الأعمدة الموجودة: {present}. "
-            "الأعمدة المقبولة للكود: product_id / sku / كود المنتج — "
-            "وللاسم: product_name / اسم المنتج / الصنف."
+            "Missing required catalog column(s) / أعمدة كتالوج مطلوبة مفقودة: "
+            f"{missing_names}. Detected source columns / الأعمدة الموجودة: {present}. "
+            "Required aliases include SKU: product_id / sku / كود المنتج; "
+            "name: product_name / اسم المنتج / الصنف; unit: unit / uom / الوحدة; "
+            "price: price / unit price / السعر.",
+            diagnostics=result.diagnostics,
+            detected_column_mapping=columns,
+            unmapped_source_columns=unmapped_columns,
         )
 
     products: list[CatalogProduct] = []
     seen_ids: dict[str, int] = {}
-    skipped_blank = 0
-    truncated = False
+    diagnostics = result.diagnostics
 
     for line_number, row in enumerate(body, start=2):
-        if len(products) >= MAX_CATALOG_ROWS:
-            truncated = True
+        # Empty spreadsheet/CSV rows are explicitly reported, but do not turn
+        # an otherwise valid merchant export into a failure.
+        if not any(str(value).strip() for value in row.values() if value is not None):
+            diagnostics.blank_row_count += 1
+            continue
+
+        diagnostics.data_row_count += 1
+        if diagnostics.data_row_count > MAX_CATALOG_ROWS:
+            diagnostics.row_limit_exceeded = True
+            _row_example(
+                diagnostics,
+                line_number=line_number,
+                product_id=None,
+                issues=[f"row limit exceeded ({MAX_CATALOG_ROWS})"],
+            )
             break
 
         product_id = str(row.get(columns["product_id"]) or "").strip()
         product_name = re.sub(
             r"\s+", " ", str(row.get(columns["product_name"]) or "")
         ).strip()
+        unit = str(row.get(columns["unit"]) or "").strip()
+        issues: list[str] = []
 
-        if not product_id and not product_name:
-            skipped_blank += 1
-            continue
         if not product_id:
-            raise CatalogError(f"صف رقم {line_number}: كود المنتج مفقود.")
-        if not product_name:
-            raise CatalogError(
-                f"صف رقم {line_number}: اسم المنتج مفقود (الكود {product_id})."
+            diagnostics.missing_sku_count += 1
+            issues.append("missing SKU / كود المنتج مفقود")
+        elif product_id in seen_ids:
+            diagnostics.duplicate_sku_count += 1
+            issues.append(
+                f"duplicate SKU '{product_id}' (first seen on row {seen_ids[product_id]})"
             )
+        else:
+            seen_ids[product_id] = line_number
 
-        if product_id in seen_ids:
-            raise CatalogError(
-                f"الكود '{product_id}' مكرر في صف {seen_ids[product_id]} وصف "
-                f"{line_number}. لازم كل كود يكون فريد."
+        if not product_name:
+            diagnostics.missing_name_count += 1
+            issues.append("missing product name / اسم المنتج مفقود")
+        if not unit:
+            diagnostics.missing_unit_count += 1
+            issues.append("missing unit / وحدة الصنف مفقودة")
+
+        price: Decimal | None = None
+        try:
+            price = _parse_catalog_price(row.get(columns["price"]))
+        except _CatalogPriceError as exc:
+            if exc.code == "missing_price":
+                diagnostics.missing_price_count += 1
+                issues.append("missing price / سعر الصنف مفقود")
+            else:
+                diagnostics.invalid_price_count += 1
+                issues.append(f"invalid price / سعر غير صالح: {exc}")
+
+        if issues:
+            diagnostics.malformed_row_count += 1
+            _row_example(
+                diagnostics,
+                line_number=line_number,
+                product_id=product_id or None,
+                issues=issues,
             )
-        seen_ids[product_id] = line_number
+            continue
 
         aliases = _split_aliases(row.get(columns["aliases"])) if "aliases" in columns else []
-        unit = str(row.get(columns["unit"]) or "").strip() if "unit" in columns else ""
-        price = _clean_price(row.get(columns["price"])) if "price" in columns else 0.0
-
+        # ``price`` is present exactly when no price issue was recorded.
+        assert price is not None
         products.append(
             CatalogProduct(
                 product_id=product_id,
                 product_name=product_name,
                 aliases=aliases,
-                unit=unit or "قطعة",
+                unit=unit,
                 price=price,
             )
         )
 
-    if not products:
-        raise CatalogError("لم يتم العثور على أي منتج صالح في الملف.")
-
-    if truncated:
-        result.warnings.append(
-            f"تم قبول أول {MAX_CATALOG_ROWS} صنف فقط؛ باقي الصفوف تم تجاهلها."
+    if diagnostics.row_limit_exceeded or diagnostics.malformed_row_count:
+        raise CatalogError(
+            _validation_error_message(diagnostics),
+            diagnostics=diagnostics,
+            detected_column_mapping=columns,
+            unmapped_source_columns=unmapped_columns,
         )
-    if skipped_blank:
-        result.warnings.append(f"تم تجاهل {skipped_blank} صف فارغ.")
+
+    if not products:
+        raise CatalogError(
+            "No usable catalog products were found / لم يتم العثور على أصناف صالحة في الملف.",
+            diagnostics=diagnostics,
+            detected_column_mapping=columns,
+            unmapped_source_columns=unmapped_columns,
+        )
+
+    if diagnostics.blank_row_count:
+        result.warnings.append(
+            f"Blank rows skipped / تم تجاهل صفوف فارغة: {diagnostics.blank_row_count}."
+        )
     if "aliases" not in columns:
         result.warnings.append(
-            "لا يوجد عمود مرادفات. النظام هيشتغل، لكن إضافة أسماء بالعامية "
-            "لكل صنف بترفع دقة المطابقة بشكل ملحوظ."
+            "No aliases column / لا يوجد عمود مرادفات. إضافة أسماء بالعامية لكل صنف "
+            "ترفع دقة المطابقة بشكل ملحوظ."
         )
-    if "price" not in columns:
-        result.warnings.append("لا يوجد عمود سعر؛ تم ضبط كل الأسعار على صفر.")
+    if unmapped_columns:
+        result.warnings.append(
+            "Unmapped source columns / أعمدة لم تُستخدم: " + ", ".join(unmapped_columns)
+        )
 
     result.products = products
     return result

@@ -1,8 +1,11 @@
 """Pydantic models for structured order data."""
 
+from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer, field_validator
+
+from .money import ZERO, api_money, from_storage
 
 
 class CatalogProduct(BaseModel):
@@ -11,7 +14,25 @@ class CatalogProduct(BaseModel):
     product_name: str
     aliases: list[str] = Field(default_factory=list)
     unit: str
-    price: float
+    # Catalog price is commercial input. Keep it as Decimal everywhere the
+    # matcher and review pipeline handle it; the serializer below is the one
+    # deliberate compatibility boundary for existing JSON consumers.
+    price: Decimal
+
+    @field_validator("price", mode="before")
+    @classmethod
+    def _validate_catalog_price(cls, value: object) -> Decimal:
+        # Strict two-decimal validation belongs at catalog ingress. This model
+        # also reads a pre-pilot catalog row that may retain a legacy price with
+        # more scale; preserve that evidence rather than silently rounding it.
+        price = from_storage(value, "Catalog price")
+        if price < ZERO:
+            raise ValueError("Catalog price must not be negative")
+        return price
+
+    @field_serializer("price", when_used="json")
+    def _serialize_catalog_price(self, value: Decimal) -> float:
+        return api_money(value, "Catalog price")
 
 
 class ExtractedItem(BaseModel):
@@ -37,7 +58,21 @@ class MatchCandidate(BaseModel):
     product_name: str
     score: float = Field(ge=0.0, le=1.0, description="Match confidence 0-1")
     unit: str
-    price: float
+    # Candidate prices originate only from the catalog. They remain Decimal
+    # until the JSON presentation boundary, just like CatalogProduct.price.
+    price: Decimal
+
+    @field_validator("price", mode="before")
+    @classmethod
+    def _validate_candidate_price(cls, value: object) -> Decimal:
+        price = from_storage(value, "Catalog price")
+        if price < ZERO:
+            raise ValueError("Catalog price must not be negative")
+        return price
+
+    @field_serializer("price", when_used="json")
+    def _serialize_candidate_price(self, value: Decimal) -> float:
+        return api_money(value, "Catalog price")
 
 
 class OrderLineResult(BaseModel):
@@ -47,6 +82,16 @@ class OrderLineResult(BaseModel):
     extracted_product: str = Field(description="What the system understood")
     extracted_quantity: float
     extracted_unit: str
+    # Customer-provided request evidence is separate from the final commercial
+    # decision.  The latter is populated only by an attributable human review.
+    requested_unit: Optional[str] = None
+    final_quantity: Optional[float] = None
+    final_unit: Optional[str] = None
+    catalog_unit: Optional[str] = None
+    unit_check_status: str = "PENDING_CATALOG_SELECTION"
+    unit_resolution: Optional[str] = None
+    unit_resolution_note: Optional[str] = None
+    requires_unit_resolution: bool = False
     matched_product: Optional[CatalogProduct] = None
     recommended_product: Optional[CatalogProduct] = None
     recommendation_decision: Optional[str] = Field(
@@ -81,6 +126,7 @@ class OrderLineResult(BaseModel):
     catalog_price: Optional[float] = None
     price_override: Optional[float] = None
     price_overridden: bool = False
+    line_total: Optional[float] = None
     is_manual_line: bool = False
 
 
@@ -111,6 +157,36 @@ class TimeSavedEstimate(BaseModel):
     )
 
 
+class CatalogRowDiagnostic(BaseModel):
+    """One bounded, operator-safe example of a rejected catalog row."""
+
+    line_number: int
+    issues: list[str] = Field(default_factory=list)
+    product_id: Optional[str] = None
+
+
+class CatalogImportDiagnostics(BaseModel):
+    """Structured validation evidence for one catalog upload attempt.
+
+    The importer never repairs or partially installs malformed merchant data.
+    Counts cover all rows scanned (up to the hard row limit) while examples are
+    intentionally bounded for a usable operator response.
+    """
+
+    data_row_count: int = 0
+    missing_required_columns: list[str] = Field(default_factory=list)
+    blank_row_count: int = 0
+    malformed_row_count: int = 0
+    duplicate_sku_count: int = 0
+    missing_sku_count: int = 0
+    missing_name_count: int = 0
+    missing_price_count: int = 0
+    invalid_price_count: int = 0
+    missing_unit_count: int = 0
+    row_limit_exceeded: bool = False
+    malformed_row_examples: list[CatalogRowDiagnostic] = Field(default_factory=list)
+
+
 class CatalogUploadResult(BaseModel):
     """Outcome of replacing the working catalog."""
     product_count: int
@@ -121,6 +197,9 @@ class CatalogUploadResult(BaseModel):
     detected_encoding: Optional[str] = None
     source_format: Optional[str] = None
     warnings: list[str] = Field(default_factory=list)
+    detected_column_mapping: dict[str, str] = Field(default_factory=dict)
+    unmapped_source_columns: list[str] = Field(default_factory=list)
+    diagnostics: CatalogImportDiagnostics = Field(default_factory=CatalogImportDiagnostics)
 
 
 class OrderSummary(BaseModel):
@@ -160,6 +239,14 @@ class ApprovedSnapshotItem(BaseModel):
     product_name: str
     quantity: float
     unit: str
+    requested_unit: Optional[str] = None
+    catalog_unit: Optional[str] = None
+    unit_check_status: str = "LEGACY_APPROVED"
+    unit_resolution: Optional[str] = None
+    unit_resolution_note: Optional[str] = None
+    unit_resolution_actor: Optional[str] = None
+    unit_resolved_at: Optional[str] = None
+    unit_resolution_action_id: Optional[str] = None
     price: float
     confidence: float
     model_recommendation_id: Optional[str] = None
@@ -178,6 +265,7 @@ class ApprovedSnapshotItem(BaseModel):
     catalog_price: Optional[float] = None
     price_override: Optional[float] = None
     price_overridden: bool = False
+    line_total: Optional[float] = None
     is_manual_line: bool = False
 
 
@@ -207,6 +295,15 @@ class OrderResult(BaseModel):
 
 class OrderRequest(BaseModel):
     """Incoming order processing request."""
+
+    action_id: str = Field(
+        min_length=1,
+        max_length=200,
+        description=(
+            "Client-generated idempotency identifier for this one logical order "
+            "submission. Retries must reuse it unchanged."
+        ),
+    )
     message: str = Field(
         min_length=1,
         max_length=20000,
@@ -226,6 +323,8 @@ class ItemReviewRequest(BaseModel):
     selected_sku: Optional[str] = None
     quantity: Optional[float] = Field(default=None, gt=0)
     unit: Optional[str] = None
+    unit_resolution: Optional[Literal["HUMAN_OVERRIDE"]] = None
+    unit_resolution_note: Optional[str] = Field(default=None, max_length=500)
 
 
 class ActorActionRequest(BaseModel):

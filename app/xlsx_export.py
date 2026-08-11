@@ -28,6 +28,7 @@ real numbers so the merchant can still sum a column.
 from __future__ import annotations
 
 import io
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 from openpyxl import Workbook
@@ -39,6 +40,8 @@ from .documents import document_date
 # The thresholds the matcher itself routes on, so the colours in the file mean
 # what they mean everywhere else in the system.
 from .matcher import CONFIDENCE_HIGH, CONFIDENCE_MEDIUM
+from .money import ZERO, from_storage, money_sum
+from .money import line_total as calculated_line_total
 from .security import csv_safe
 
 # Column headers, verbatim from the CSV export, so the two files stay
@@ -137,13 +140,13 @@ def export_date(export_data: Dict[str, Any]) -> str:
     return document_date(export_data.get("last_exported_at")).replace("/", "-")
 
 
-def _number(value: Any) -> Optional[float]:
+def _number(value: Any) -> Optional[Decimal]:
     """A real number for Excel, or ``None`` so the cell stays empty."""
     if value is None or (isinstance(value, str) and not value.strip()):
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        return from_storage(value)
+    except ValueError:
         return None
 
 
@@ -156,7 +159,11 @@ def _confidence_style(confidence: float) -> tuple[str, str]:
 
 def _write(ws, row: int, column: int, value: Any, **style) -> Any:
     """Write one cell with every string neutralised against formula injection."""
-    cell = ws.cell(row=row, column=column, value=csv_safe(value))
+    cell = ws.cell(
+        row=row,
+        column=column,
+        value=value if isinstance(value, Decimal) else csv_safe(value),
+    )
     cell.font = style.get("font") or Font(name=FONT_NAME)
     if style.get("alignment") is not None:
         cell.alignment = style["alignment"]
@@ -270,15 +277,20 @@ def build_order_workbook(
     ws.freeze_panes = f"A{header_row + 1}"
 
     rendered: List[List[str]] = [list(COLUMNS)]
-    order_total = 0.0
+    frozen_line_totals: list[Decimal] = []
     row = header_row
 
     for index, item in enumerate(export_data["snapshot"], start=1):
         row = header_row + index
-        price = float(item.get("price", 0.0) or 0.0)
-        quantity = float(item.get("quantity", 0.0) or 0.0)
-        line_total = round(price * quantity, 2)
-        order_total += line_total
+        price = from_storage(item.get("price") or "0.00", "Snapshot price")
+        quantity = item.get("quantity", 0.0)
+        frozen_total = item.get("line_total")
+        line_total = (
+            from_storage(frozen_total, "Snapshot line total")
+            if frozen_total not in (None, "")
+            else calculated_line_total(price, quantity)
+        )
+        frozen_line_totals.append(line_total)
         confidence = float(item.get("confidence", 0.0) or 0.0)
 
         values = [
@@ -323,11 +335,12 @@ def build_order_workbook(
 
         rendered.append([str(value if value is not None else "") for value in values])
 
-    discount = float(export_data.get("discount") or 0.0)
+    order_total = money_sum(frozen_line_totals)
+    discount = from_storage(export_data.get("discount") or "0.00", "Discount")
     try:
-        grand_total = round(float(export_data.get("grand_total")), 2)
+        grand_total = from_storage(export_data.get("grand_total"), "Grand total")
     except (TypeError, ValueError):
-        grand_total = round(max(0.0, round(order_total, 2) - discount), 2)
+        grand_total = max(ZERO, order_total - discount)
 
     totals_row = row + 2
     totals = (

@@ -22,7 +22,11 @@ one constant before scanning every source file for it.
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
+
+from .money import ZERO, from_storage, money_sum
+from .money import line_total as calculated_line_total
 
 # Deliberately one unbroken literal: the wording-ban test strips this exact
 # constant out of each source file before scanning it, and an implicitly
@@ -36,9 +40,9 @@ CURRENCY = "ج.م"
 def money(value: Any) -> str:
     """Format an amount with thousands separators and exactly two decimals."""
     try:
-        amount = float(value or 0.0)
-    except (TypeError, ValueError):
-        amount = 0.0
+        amount = from_storage(value if value not in (None, "") else "0.00")
+    except ValueError:
+        amount = ZERO
     return f"{amount:,.2f}"
 
 
@@ -69,20 +73,20 @@ def document_date(value: Optional[str]) -> str:
     return parsed.strftime("%Y/%m/%d")
 
 
-def _amount(value: Any, fallback: float = 0.0) -> float:
+def _amount(value: Any, fallback: Decimal = ZERO) -> Decimal:
     """Return a display-safe monetary value without raising for old rows."""
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        return from_storage(value)
+    except ValueError:
         return fallback
 
 
-def _optional_amount(value: Any) -> Optional[float]:
+def _optional_amount(value: Any) -> Optional[Decimal]:
     if value is None or str(value).strip() == "":
         return None
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        return from_storage(value)
+    except ValueError:
         return None
 
 
@@ -98,7 +102,7 @@ def _is_cancelled(item: Dict[str, Any]) -> bool:
     )
 
 
-def _price_override(item: Dict[str, Any]) -> Optional[float]:
+def _price_override(item: Dict[str, Any]) -> Optional[Decimal]:
     for key in ("price_override", "unit_price_override", "override_price"):
         value = _optional_amount(item.get(key))
         if value is not None:
@@ -106,7 +110,7 @@ def _price_override(item: Dict[str, Any]) -> Optional[float]:
     return None
 
 
-def _catalog_price(item: Dict[str, Any], fallback: float) -> float:
+def _catalog_price(item: Dict[str, Any], fallback: Decimal) -> Decimal:
     for key in ("catalog_price", "original_catalog_price"):
         value = _optional_amount(item.get(key))
         if value is not None:
@@ -114,7 +118,7 @@ def _catalog_price(item: Dict[str, Any], fallback: float) -> float:
     return fallback
 
 
-def _is_price_overridden(item: Dict[str, Any], override: Optional[float]) -> bool:
+def _is_price_overridden(item: Dict[str, Any], override: Optional[Decimal]) -> bool:
     return (
         _truthy(item.get("price_overridden"))
         or _truthy(item.get("is_price_overridden"))
@@ -133,7 +137,7 @@ def build_document_context(
     no JavaScript to show a correct total.
     """
     lines: List[Dict[str, Any]] = []
-    subtotal = 0.0
+    frozen_line_totals: list[Decimal] = []
 
     for item in document.get("snapshot", []):
         # A well-formed approved snapshot never contains a cancelled row.  Keep
@@ -143,12 +147,17 @@ def build_document_context(
             continue
         index = len(lines) + 1
         override = _price_override(item)
-        price = _amount(item.get("price"), override if override is not None else 0.0)
+        price = _amount(item.get("price"), override if override is not None else ZERO)
         catalog_price = _catalog_price(item, price)
         overridden = _is_price_overridden(item, override)
-        qty = _amount(item.get("quantity"))
-        line_total = round(price * qty, 2)
-        subtotal += line_total
+        qty = item.get("quantity", 0)
+        frozen_total = item.get("line_total")
+        line_total = (
+            from_storage(frozen_total, "Snapshot line total")
+            if frozen_total not in (None, "")
+            else calculated_line_total(price, qty)
+        )
+        frozen_line_totals.append(line_total)
         lines.append(
             {
                 "index": index,
@@ -163,7 +172,7 @@ def build_document_context(
             }
         )
 
-    calculated_subtotal = round(subtotal, 2)
+    calculated_subtotal = money_sum(frozen_line_totals)
     # New approvals freeze all three values together.  The calculated fallbacks
     # preserve legacy snapshots made before order-level financials existed.
     subtotal = _optional_amount(document.get("subtotal"))
@@ -172,7 +181,7 @@ def build_document_context(
     discount = _amount(document.get("discount"))
     grand_total = _optional_amount(document.get("grand_total"))
     if grand_total is None:
-        grand_total = round(subtotal - discount, 2)
+        grand_total = max(ZERO, subtotal - discount)
 
     return {
         "shop": {

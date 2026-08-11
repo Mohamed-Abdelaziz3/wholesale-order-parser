@@ -77,9 +77,10 @@
 ---
 
 ## 🚢 النشر
-`Dockerfile` (مستخدم غير root + healthcheck) · `Procfile` · `railway.json` · `fly.toml` ·
+`Dockerfile` (مستخدم غير root + healthcheck) · `railway.json` ·
 `pyproject.toml` · **CI على GitHub Actions** بتتأكد إن التطبيق بيقوم من تثبيت نظيف ·
-`DEPLOY.md` بخطوات Railway/Fly/Docker + تشيك ليست قبل أي عرض · `ORDERS_DB_PATH` لـ volume دائم.
+دليل Railway المدعوم في `DEPLOY.md` و`docs/pilot/RAILWAY_SINGLE_MERCHANT_DEPLOYMENT.md` ·
+`ORDERS_DB_PATH` لـ volume دائم.
 
 ## 🧪 الاختبارات
 `tests/test_security_and_catalog.py` — **63 اختبار جديد**، كل واحد منهم مربوط بعيب حقيقي:
@@ -96,6 +97,6 @@
 | **مستأجر واحد** | نسخة = تاجر واحد. تاني عميل = نسخة تانية. (مقصود — مش وقته دلوقتي) |
 | SQLite | ممتازة لعشرات الآلاف من الطلبات على نسخة واحدة |
 | الهوية | باسورد مشترك أو حسابات `name:password`. مفيش SSO/2FA |
-| مفيش ربط واتساب | لسه نسخ ولصق. **متعملهاش قبل ما عميل يدفع** |
+| مفيش ربط واتساب | الطلب يُنسخ ويُلصق يدوياً؛ لا يوجد تكامل واتساب في هذا الإصدار. |
 | حصة Gemini المجانية | 429 تحت الضغط. النظام بيعمل retry، بس الحمل الحقيقي عايز حساب مدفوع |
 | خط الأساس اليدوي (45 ث/صنف) | **افتراض مش قياس** — عايره على شغل التاجر من أول أسبوع |
