@@ -28,6 +28,6 @@ openpyxl>=3.1.0
 # numpy is imported by evaluation/reranker_benchmark/score_results.py; without it
 # a plain `pytest` aborts during collection before running a single test.
 numpy>=1.26.0
-pytest>=8.0.0
+pytest>=9.1.1
 pytest-asyncio>=0.23.0
 httpx2>=2.7.0
