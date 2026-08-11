@@ -16,7 +16,7 @@ rapidfuzz>=3.9.0
 # NOTE: the import is `from google import genai`, which is provided by the
 # `google-genai` package. The older `google-generativeai` package provides
 # `google.generativeai` and will NOT satisfy this import.
-google-genai>=1.0.0
+google-genai>=2.17.0
 
 # Config
 python-dotenv>=1.0.0
