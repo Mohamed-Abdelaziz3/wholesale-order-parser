@@ -22,7 +22,7 @@ google-genai>=1.0.0
 python-dotenv>=1.0.0
 
 # Catalog upload: .xlsx support (merchants send Excel files)
-openpyxl>=3.1.0
+openpyxl>=3.1.5
 
 # Tests
 # numpy is imported by evaluation/reranker_benchmark/score_results.py; without it
