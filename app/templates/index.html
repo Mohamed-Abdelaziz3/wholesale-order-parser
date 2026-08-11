@@ -188,7 +188,8 @@ select{min-width:240px}
     <div id="catalogPanel" class="hidden">
       <p class="hint">
         ارفع ملف الأصناف بتاعك (CSV أو Excel). لازم يكون فيه عمود <strong>كود المنتج</strong> وعمود
-        <strong>اسم المنتج</strong>. عمود <strong>المرادفات</strong> (أسماء بالعامية مفصولة بـ <strong>|</strong>)
+        <strong>اسم المنتج</strong> و<strong>الوحدة</strong> و<strong>السعر</strong>. لا يتم افتراض سعر أو وحدة
+        عند النقص. عمود <strong>المرادفات</strong> (أسماء بالعامية مفصولة بـ <strong>|</strong>)
         اختياري لكنه بيرفع الدقة بشكل كبير. الرفع بيستبدل الكتالوج الحالي بالكامل —
         الطلبات المعتمدة القديمة بتفضل زي ما هي بأسعارها وأسماءها وقت الاعتماد.
       </p>
@@ -398,6 +399,8 @@ const OPERATOR = {{ operator | tojson }};
 let catalogCount = 0;
 let currentOrder = null;
 let busy = false;
+let pendingProcess = null;
+let commercialEditsPending = false;
 
 document.getElementById('operatorChip').textContent = OPERATOR;
 document.getElementById('reviewerName').textContent = OPERATOR;
@@ -447,6 +450,48 @@ async function readError(response, fallback) {
 
 /* ------------------------------ catalog --------------------------- */
 
+function catalogDiagnosticsHtml(result) {
+  const diagnostics = result && result.diagnostics;
+  const mapping = result && result.detected_column_mapping;
+  const unmapped = result && result.unmapped_source_columns;
+  if (!diagnostics && !mapping && !(unmapped && unmapped.length)) return '';
+
+  const labels = [
+    ['malformed_row_count', 'صف غير صالح'],
+    ['duplicate_sku_count', 'كود مكرر'],
+    ['missing_sku_count', 'كود مفقود'],
+    ['missing_name_count', 'اسم مفقود'],
+    ['missing_price_count', 'سعر مفقود'],
+    ['invalid_price_count', 'سعر غير صالح'],
+    ['missing_unit_count', 'وحدة مفقودة'],
+    ['blank_row_count', 'صف فارغ'],
+  ];
+  const counts = diagnostics ? labels
+    .filter(([key]) => Number(diagnostics[key] || 0) > 0)
+    .map(([key, label]) => `${esc(label)}: ${esc(diagnostics[key])}`)
+    .join(' · ') : '';
+  const mapRows = mapping ? Object.entries(mapping)
+    .map(([canonical, source]) => `<li><code>${esc(canonical)}</code> ← ${esc(source)}</li>`)
+    .join('') : '';
+  const exampleRows = diagnostics && Array.isArray(diagnostics.malformed_row_examples)
+    ? diagnostics.malformed_row_examples.map((example) =>
+      `<li>صف ${esc(example.line_number)}${example.product_id ? ` (${esc(example.product_id)})` : ''}: ` +
+      `${(example.issues || []).map(esc).join(' · ')}</li>`
+    ).join('') : '';
+  const unmappedText = unmapped && unmapped.length
+    ? `<p>أعمدة لم تُستخدم: ${unmapped.map(esc).join('، ')}</p>` : '';
+  const missingColumnsText = diagnostics && diagnostics.missing_required_columns && diagnostics.missing_required_columns.length
+    ? `<p>أعمدة مطلوبة مفقودة: ${diagnostics.missing_required_columns.map(esc).join('، ')}</p>` : '';
+  const limitText = diagnostics && diagnostics.row_limit_exceeded
+    ? '<p>تم رفض الملف لتجاوز الحد الأقصى لعدد الأصناف.</p>' : '';
+
+  return `<details class="hint" style="margin-top:10px"><summary>تفاصيل فحص ملف الكتالوج</summary>` +
+    `${counts ? `<p>${counts}</p>` : ''}${missingColumnsText}${limitText}${unmappedText}` +
+    `${mapRows ? `<p>تعيين الأعمدة المكتشف:</p><ul>${mapRows}</ul>` : ''}` +
+    `${exampleRows ? `<p>أمثلة على الصفوف التي تحتاج تصحيحاً:</p><ul>${exampleRows}</ul>` : ''}` +
+    `</details>`;
+}
+
 function toggleCatalog() {
   const panel = document.getElementById('catalogPanel');
   panel.classList.toggle('hidden');
@@ -487,15 +532,20 @@ async function uploadCatalog() {
     const response = await api('/api/catalog/upload', { method: 'POST', body });
 
     if (!response.ok) {
-      const message = await readError(response, 'تعذّر رفع الكتالوج.');
-      box.innerHTML = `<div class="banner err">⚠️ ${esc(message)}</div>`;
+      let errorResult = null;
+      try { errorResult = await response.json(); } catch (_) { /* use fallback */ }
+      const message = errorResult && typeof errorResult.detail === 'string'
+        ? errorResult.detail : 'تعذّر رفع الكتالوج.';
+      box.innerHTML = `<div class="banner err">⚠️ ${esc(message)}</div>` +
+        catalogDiagnosticsHtml(errorResult);
     } else {
       const result = await response.json();
       const warnings = (result.warnings || [])
         .map((w) => `<div class="banner warn">ℹ️ ${esc(w)}</div>`).join('');
       box.innerHTML =
         `<div class="banner ok">✅ تم تركيب ${esc(result.product_count)} صنف من «${esc(result.source_name || '')}»` +
-        ` — الترميز: ${esc(result.detected_encoding || '')}</div>` + warnings;
+        ` — الترميز: ${esc(result.detected_encoding || '')}</div>` + warnings +
+        catalogDiagnosticsHtml(result);
       await loadCatalog();
       toast(`الكتالوج اتحدّث: ${result.product_count} صنف`, 'ok');
     }
@@ -513,26 +563,48 @@ async function processOrder() {
   const message = document.getElementById('orderInput').value.trim();
   if (!message) { toast('اكتب رسالة الطلب الأول', 'err'); return; }
 
+  // The server treats this as one durable logical command. Keep it in memory
+  // alongside the exact pasted message so a timeout/retry cannot create a
+  // second order. We deliberately do not place customer text in browser
+  // storage; a page reload leaves the text visible and the operator can choose
+  // a new submission explicitly.
+  if (!pendingProcess || pendingProcess.message !== message) {
+    pendingProcess = { message, actionId: actionId('process') };
+  }
+  const submission = pendingProcess;
+
   busy = true;
   const button = document.getElementById('analyzeBtn');
   button.disabled = true;
-  button.innerHTML = '<span class="spinner"></span> جارٍ التحليل';
+  button.innerHTML = '<span class="spinner"></span> جارٍ التحليل… لا تعيد الإرسال';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 65_000);
 
   try {
     const response = await api('/api/process', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, action_id: submission.actionId }),
+      signal: controller.signal,
     });
     if (!response.ok) {
       toast(await readError(response, 'تعذّر تحليل الطلب.'), 'err');
     } else {
       currentOrder = await response.json();
+      pendingProcess = null;
       render();
       document.getElementById('results').scrollIntoView({ behavior: 'smooth', block: 'start' });
       loadOrders();
     }
-  } catch (error) { /* handled by api() */ }
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      toast('انتهت مهلة الاتصال. أعد المحاولة؛ نفس الطلب سيُستكمل بأمان.', 'err');
+    } else if (error && error.message !== 'unauthenticated') {
+      toast('تعذّر الاتصال بالخادم. أعد المحاولة؛ نفس الطلب سيُستكمل بأمان.', 'err');
+    }
+  } finally {
+    clearTimeout(timeout);
+  }
 
   busy = false;
   button.disabled = false;
@@ -611,7 +683,12 @@ function pickProduct(itemId, sku, name, unit) {
   if (box) box.value = `${name} (${sku})`;
   if (String(itemId) === 'manual-new') {
     const unitBox = document.getElementById('addLineUnit');
-    if (unitBox && !unitBox.value.trim()) unitBox.value = unit || '';
+    if (unitBox) unitBox.value = unit || '';
+  } else {
+    const unitBox = document.getElementById(`unit-${itemId}`);
+    if (unitBox) unitBox.value = unit || '';
+    commercialEditsPending = true;
+    flexRefreshTotals();
   }
   if (panel) panel.classList.remove('open');
 }
@@ -630,18 +707,24 @@ function closeAllPanels(except) {
  * ------------------------------------------------------------------ */
 
 function fmtMoney(value) {
-  return num(value, 0).toLocaleString('en-US',
-    { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (value === null || value === undefined || value === '') return '—';
+  // Formatting only. The server owns every commercial calculation.
+  return new Intl.NumberFormat('en-US',
+    { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
 }
 
+const MONEY_INPUT = /^\d+(?:\.\d{1,2})?$/;
+
 function round2(value) {
-  return Math.round((num(value, 0) + Number.EPSILON) * 100) / 100;
+  // Retained for compatibility with the inactive legacy renderer. Do not use
+  // browser arithmetic for commercial figures.
+  return value;
 }
 
 function unitPriceOf(item) {
   if (item.human_decision === 'NOT_FOUND') return null;
   const product = item.matched_product || item.recommended_product;
-  return product ? num(product.price, 0) : null;
+  return product && product.price != null ? product.price : null;
 }
 
 function liveQuantity(item) {
@@ -651,18 +734,15 @@ function liveQuantity(item) {
 }
 
 function lineTotalOf(item) {
-  const price = unitPriceOf(item);
-  if (price === null) return null;
-  return round2(price * liveQuantity(item));
+  return item && item.line_total != null ? item.line_total : null;
 }
 
 function orderHasPrices(data) {
-  return (data.items || []).some((i) => num(unitPriceOf(i), 0) > 0);
+  return (data.items || []).some((i) => unitPriceOf(i) !== null);
 }
 
 function orderTotalOf(data) {
-  return round2((data.items || []).reduce(
-    (sum, item) => sum + num(lineTotalOf(item), 0), 0));
+  return data ? data.grand_total : null;
 }
 
 /* Recomputed on every quantity keystroke, so the number next to the approve
@@ -789,7 +869,7 @@ function legacyRender() {
   refreshTotals();
   renderTimeCard(data, approved);
 
-  document.getElementById('approveBtn').disabled = approved || pending > 0;
+  document.getElementById('approveBtn').disabled = approved || pending > 0 || unresolvedUnitCount > 0;
   document.getElementById('approveBtn').textContent = approved ? 'تم الاعتماد' : 'اعتماد الطلب';
   const batchable = data.items.filter(
     (i) => !i.is_human_confirmed && i.recommendation_decision === 'SELECT').length;
@@ -825,19 +905,19 @@ function flexIsExcluded(item) {
 
 function flexPriceOverride(item) {
   for (const key of ['price_override', 'unit_price_override', 'override_price']) {
-    const value = flexOptionalNumber(item && item[key]);
-    if (value !== null) return value;
+    const value = item && item[key];
+    if (value !== null && value !== undefined && String(value).trim() !== '') return value;
   }
   return null;
 }
 
 function flexCatalogPrice(item) {
   for (const key of ['catalog_price', 'original_catalog_price']) {
-    const value = flexOptionalNumber(item && item[key]);
-    if (value !== null) return value;
+    const value = item && item[key];
+    if (value !== null && value !== undefined && String(value).trim() !== '') return value;
   }
   const product = item && (item.matched_product || item.recommended_product);
-  return product ? flexOptionalNumber(product.price) : flexOptionalNumber(item && item.price);
+  return product && product.price != null ? product.price : (item && item.price);
 }
 
 function flexPriceOverridden(item) {
@@ -851,49 +931,40 @@ function flexUnitPrice(item) {
   const override = flexPriceOverride(item);
   if (override !== null) return override;
   const product = item && (item.matched_product || item.recommended_product);
-  return product ? flexOptionalNumber(product.price) : flexCatalogPrice(item);
+  return product && product.price != null ? product.price : flexCatalogPrice(item);
 }
 
 function flexLiveUnitPrice(item) {
-  const input = document.getElementById(`price-${item.id}`);
-  const typed = input ? flexOptionalNumber(input.value) : null;
-  return typed !== null && typed >= 0 ? typed : flexUnitPrice(item);
+  return flexUnitPrice(item);
 }
 
 function flexLiveQuantity(item) {
-  const input = document.getElementById(`qty-${item.id}`);
-  const typed = input ? flexOptionalNumber(input.value) : null;
-  return typed !== null && typed > 0 ? typed : num(item.extracted_quantity, 0);
+  return item && item.final_quantity != null ? item.final_quantity : item && item.extracted_quantity;
 }
 
 function flexLineTotal(item) {
-  const price = flexLiveUnitPrice(item);
-  return price === null ? null : round2(price * flexLiveQuantity(item));
+  return item && item.line_total != null ? item.line_total : null;
 }
 
 function flexStoredDiscount(data) {
-  const discount = flexOptionalNumber(data && data.discount);
-  return discount !== null && discount >= 0 ? discount : 0;
+  return data && data.discount != null ? data.discount : '0.00';
 }
 
 function flexLiveDiscount(data) {
-  const input = document.getElementById('discountAmount');
-  const typed = input ? flexOptionalNumber(input.value) : null;
-  return typed !== null && typed >= 0 ? typed : flexStoredDiscount(data);
+  return flexStoredDiscount(data);
 }
 
 function flexSubtotal(data) {
-  return round2(((data && data.items) || []).reduce(
-    (sum, item) => sum + num(flexLineTotal(item), 0), 0));
+  return data && data.subtotal != null ? data.subtotal : '0.00';
 }
 
 function flexGrandTotal(data) {
-  return round2(flexSubtotal(data) - flexLiveDiscount(data));
+  return data && data.grand_total != null ? data.grand_total : '0.00';
 }
 
 function flexHasPrices(data) {
   return ((data && data.items) || []).some((item) =>
-    !flexIsExcluded(item) && num(flexUnitPrice(item), 0) > 0);
+    !flexIsExcluded(item) && flexUnitPrice(item) !== null && flexUnitPrice(item) !== undefined);
 }
 
 function flexRefreshTotals() {
@@ -910,19 +981,52 @@ function flexRefreshTotals() {
 
   const subtotal = flexSubtotal(data);
   const discount = flexLiveDiscount(data);
+  const grandTotal = flexGrandTotal(data);
   const notFound = (data.items || []).filter(flexIsNotFound).length;
   const cancelled = (data.items || []).filter(flexIsCancelled).length;
-  if (!flexHasPrices(data) && discount === 0) { box.innerHTML = ''; return; }
+  if (!flexHasPrices(data) && String(discount) === '0.00') { box.innerHTML = ''; return; }
+
+  if (commercialEditsPending) {
+    box.innerHTML = '<div class="ordertotal"><span class="n">تم تعديل بيانات تجارية. احفظ القرار أو السعر أو الخصم لعرض الإجمالي الدقيق من الخادم.</span></div>';
+    return;
+  }
 
   const notes = [];
   if (notFound) notes.push(`مش شامل ${esc(notFound)} صنف غير موجود بالكتالوج`);
   if (cancelled) notes.push(`مش شامل ${esc(cancelled)} سطر اتلغى بطلب العميل`);
   box.innerHTML =
     '<div class="ordertotal"><span class="l">إجمالي الطلب:</span>' +
-    `<span class="v">${esc(fmtMoney(flexGrandTotal(data)))} ج.م</span>` +
+    `<span class="v">${esc(fmtMoney(grandTotal))} ج.م</span>` +
     `<span class="n">قبل الخصم: ${esc(fmtMoney(subtotal))} ج.م · الخصم: ${esc(fmtMoney(discount))} ج.م</span>` +
     (notes.length ? `<span class="n">${notes.join(' · ')}</span>` : '') +
     '</div>';
+}
+
+function displayedRequestedUnit(item) {
+  const value = item && (item.requested_unit ?? item.extracted_unit);
+  return value && String(value).trim() ? String(value).trim() : 'غير مذكورة';
+}
+
+function unitGuardrail(item, locked) {
+  const requested = displayedRequestedUnit(item);
+  const catalog = (item && (item.catalog_unit ||
+    (item.matched_product && item.matched_product.unit) ||
+    (item.recommended_product && item.recommended_product.unit))) || 'يُحدد عند اختيار الصنف';
+  const blocking = Boolean(item && item.requires_unit_resolution);
+  const status = item && item.unit_check_status;
+  const resolved = item && item.unit_resolution === 'HUMAN_OVERRIDE';
+  if (locked) {
+    if (resolved) {
+      return `<div class="hint" style="color:var(--warning)">تمت مراجعة اختلاف الوحدة: ${esc(requested)} → ${esc(catalog)}</div>`;
+    }
+    return `<div class="hint">وحدة العميل: ${esc(requested)} · وحدة الكتالوج: ${esc(catalog)}</div>`;
+  }
+  const warning = blocking
+    ? `<div class="banner warn" style="margin:6px 0;padding:7px">⚠️ وحدة العميل «${esc(requested)}» لا تطابق وحدة الكتالوج «${esc(catalog)}» أو أنها غير مذكورة. لا يوجد تحويل تلقائي. اكتب الكمية النهائية بوحدة الكتالوج وسجّل سبب القرار.</div>`
+    : `<div class="hint">وحدة العميل: ${esc(requested)} · وحدة الكتالوج: ${esc(catalog)}. إذا اختلفت الوحدة بعد تغيير الصنف، سجّل قراراً بشرياً صريحاً.</div>`;
+  return warning +
+    `<label class="hint" style="display:block;margin-top:4px"><input type="checkbox" id="unit-override-${esc(item.id)}"> أكّد أنني راجعت اختلاف/غياب الوحدة وأدخلت الكمية النهائية بوحدة الكتالوج</label>` +
+    `<input type="text" id="unit-note-${esc(item.id)}" maxlength="500" placeholder="سبب قرار الوحدة (مطلوب فقط عند الاختلاف)" style="width:100%;margin-top:4px">`;
 }
 
 function renderCustomerDetails(data, approved) {
@@ -940,7 +1044,7 @@ function renderCustomerDetails(data, approved) {
 
 function renderDiscountTools(data, approved) {
   const input = document.getElementById('discountAmount');
-  input.value = flexStoredDiscount(data).toFixed(2);
+  input.value = String(flexStoredDiscount(data));
   input.disabled = approved;
   document.getElementById('saveDiscountBtn').classList.toggle('hidden', approved);
 }
@@ -962,6 +1066,7 @@ function flexPriceCell(item, canOverride) {
 function render() {
   const data = currentOrder;
   if (!data) return;
+  commercialEditsPending = false;
   document.getElementById('results').classList.remove('hidden');
 
   const items = data.items || [];
@@ -969,7 +1074,11 @@ function render() {
   const activeItems = items.filter((item) => !flexIsCancelled(item));
   const cancelledCount = items.length - activeItems.length;
   const confirmed = activeItems.filter((item) => item.is_human_confirmed).length;
-  const pending = activeItems.filter((item) => !item.is_human_confirmed && !flexIsExcluded(item)).length;
+  const pendingItems = activeItems.filter((item) =>
+    !flexIsExcluded(item) && (!item.is_human_confirmed || item.requires_unit_resolution));
+  const pending = pendingItems.length;
+  const unresolvedUnitCount = activeItems.filter((item) =>
+    !flexIsExcluded(item) && item.requires_unit_resolution).length;
 
   document.getElementById('reviewTable').classList.toggle('no-prices', !flexHasPrices(data));
   document.getElementById('addLineTools').classList.toggle('hidden', approved);
@@ -1037,6 +1146,7 @@ function render() {
     if (flexIsCancelled(item)) statusBadge = '<span class="badge cancelled">ملغي</span>';
     else if (flexIsNotFound(item)) statusBadge = '<span class="badge gone">غير موجود</span>';
     else if (approved) statusBadge = '<span class="badge appr">مُعتمد</span>';
+    else if (item.requires_unit_resolution) statusBadge = '<span class="badge pending">راجع الوحدة</span>';
     else if (item.is_human_confirmed) statusBadge = '<span class="badge done">مؤكد</span>';
     else statusBadge = '<span class="badge pending">محتاج قرار</span>';
 
@@ -1056,15 +1166,19 @@ function render() {
 
     const unitPrice = flexUnitPrice(item);
     const lineTotal = flexLineTotal(item);
+    const finalUnitValue = item.final_unit ||
+      (item.matched_product && item.matched_product.unit) ||
+      (item.recommended_product && item.recommended_product.unit) || '';
+    const unitSafety = unitGuardrail(item, reviewLocked);
     const canOverride = !approved && !flexIsExcluded(item) && item.is_human_confirmed && unitPrice !== null;
     tr.innerHTML =
       `<td>${index + 1}</td>` +
       `<td style="color:var(--text-secondary);max-width:230px">${esc(item.raw_text)}</td>` +
       `<td>${productCell}</td>` +
       `<td><input type="number" step="0.5" min="0.1" style="width:78px" id="qty-${esc(item.id)}" ` +
-      `value="${esc(num(item.extracted_quantity, 1))}" ${reviewLocked ? 'disabled' : ''}></td>` +
+      `value="${esc(num(item.final_quantity ?? item.extracted_quantity, 1))}" ${reviewLocked ? 'disabled' : ''}></td>` +
       `<td><input type="text" style="width:88px" id="unit-${esc(item.id)}" ` +
-      `value="${esc(item.extracted_unit)}" ${reviewLocked ? 'disabled' : ''}></td>` +
+      `value="${esc(finalUnitValue)}" ${reviewLocked ? 'disabled' : ''}>${unitSafety}</td>` +
       `<td class="col-price money">${flexPriceCell(item, canOverride)}</td>` +
       `<td class="col-price money" id="line-total-${esc(item.id)}">` +
       `${lineTotal === null ? '—' : esc(fmtMoney(lineTotal))}</td>` +
@@ -1079,7 +1193,8 @@ function render() {
   document.getElementById('approveBtn').disabled = approved || pending > 0;
   document.getElementById('approveBtn').textContent = approved ? 'تم الاعتماد' : 'اعتماد الطلب';
   const batchable = activeItems.filter((item) =>
-    !item.is_human_confirmed && !flexIsExcluded(item) && item.recommendation_decision === 'SELECT').length;
+    !item.is_human_confirmed && !flexIsExcluded(item) && !item.requires_unit_resolution &&
+    item.recommendation_decision === 'SELECT').length;
   const bulkBtn = document.getElementById('confirmAllBtn');
   bulkBtn.classList.toggle('hidden', approved || batchable === 0);
   bulkBtn.textContent = `تأكيد السطور الأكيدة (${batchable})`;
@@ -1201,8 +1316,8 @@ async function cancelLine(itemId) {
 async function savePriceOverride(itemId) {
   if (!currentOrder || currentOrder.status === 'approved') return;
   const input = document.getElementById(`price-${itemId}`);
-  const price = input ? flexOptionalNumber(input.value) : null;
-  if (price === null || price < 0) { toast('اكتب سعر صحيح', 'err'); return; }
+  const price = input ? input.value.trim() : '';
+  if (!MONEY_INPUT.test(price)) { toast('اكتب سعر صحيح بمنزلتين عشريتين كحد أقصى', 'err'); return; }
   try {
     await applyOrderMutation(`/api/orders/${currentOrder.order_id}/items/${itemId}/price`, 'PUT', {
       actor: OPERATOR,
@@ -1218,8 +1333,8 @@ async function savePriceOverride(itemId) {
 async function saveDiscount() {
   if (!currentOrder || currentOrder.status === 'approved') return;
   const input = document.getElementById('discountAmount');
-  const discount = input ? flexOptionalNumber(input.value) : null;
-  if (discount === null || discount < 0) { toast('اكتب خصم صحيح', 'err'); return; }
+  const discount = input ? input.value.trim() : '';
+  if (!MONEY_INPUT.test(discount)) { toast('اكتب خصم صحيح بمنزلتين عشريتين كحد أقصى', 'err'); return; }
   try {
     await applyOrderMutation(`/api/orders/${currentOrder.order_id}/discount`, 'PUT', {
       actor: OPERATOR,
@@ -1249,10 +1364,23 @@ async function confirmRow(itemId, silent) {
   const sku = skuEl ? skuEl.value : '';
   const quantity = num(qtyEl ? qtyEl.value : 0, 0);
   const unit = ((unitEl ? unitEl.value : '') || '').trim();
+  const item = (currentOrder.items || []).find((candidate) => String(candidate.id) === String(itemId));
+  const overrideBox = document.getElementById(`unit-override-${itemId}`);
+  const noteBox = document.getElementById(`unit-note-${itemId}`);
+  const unitResolution = overrideBox && overrideBox.checked ? 'HUMAN_OVERRIDE' : null;
+  const unitResolutionNote = ((noteBox ? noteBox.value : '') || '').trim();
 
   if (!sku) { if (!silent) toast('اختار الصنف الأول', 'err'); return false; }
   if (!(quantity > 0)) { if (!silent) toast('الكمية لازم تكون أكبر من صفر', 'err'); return false; }
   if (!unit) { if (!silent) toast('اكتب الوحدة', 'err'); return false; }
+  if (item && item.requires_unit_resolution && !unitResolution) {
+    if (!silent) toast('اختلاف الوحدة يحتاج قراراً بشرياً صريحاً وسبباً مكتوباً', 'err');
+    return false;
+  }
+  if (unitResolution && !unitResolutionNote) {
+    if (!silent) toast('اكتب سبب قرار اختلاف الوحدة', 'err');
+    return false;
+  }
 
   try {
     currentOrder = await sendReview(itemId, {
@@ -1262,6 +1390,8 @@ async function confirmRow(itemId, silent) {
       selected_sku: sku,
       quantity,
       unit,
+      unit_resolution: unitResolution,
+      unit_resolution_note: unitResolutionNote || null,
     });
     if (!silent) { render(); loadOrders(); toast('اتسجّل القرار', 'ok'); }
     return true;
@@ -1295,7 +1425,8 @@ async function confirmAllRows() {
   // Ambiguous or low-confidence lines stay pre-filled but need an individual
   // click, so a close size/pack variant can never be rubber-stamped in bulk.
   const all = currentOrder.items.filter((i) => !i.is_human_confirmed && !flexIsExcluded(i));
-  const pending = all.filter((i) => i.recommendation_decision === 'SELECT');
+  const pending = all.filter((i) =>
+    i.recommendation_decision === 'SELECT' && !i.requires_unit_resolution);
   const needsAttention = all.length - pending.length;
   let done = 0;
   let skipped = 0;
@@ -1316,6 +1447,10 @@ async function confirmAllRows() {
 }
 
 async function approveOrder() {
+  if (!currentOrder || (currentOrder.items || []).some((item) => item.requires_unit_resolution)) {
+    toast('لا يمكن اعتماد الطلب قبل حل اختلافات الوحدات وتسجيل القرار البشري', 'err');
+    return;
+  }
   const button = document.getElementById('approveBtn');
   button.disabled = true;
   button.innerHTML = '<span class="spinner"></span> جارٍ الاعتماد';
@@ -1564,6 +1699,7 @@ async function loadOrders() {
 
 function clearAll() {
   document.getElementById('orderInput').value = '';
+  pendingProcess = null;
   document.getElementById('results').classList.add('hidden');
   currentOrder = null;
   window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -1594,11 +1730,16 @@ document.addEventListener('focusin', (e) => {
 document.addEventListener('input', (e) => {
   const box = e.target.closest('.combo input.q');
   if (box) { onComboInput(box.dataset.item, box.value); return; }
-  // Live order total: typing a quantity updates the line and the running sum
-  // without a round trip, so the merchant can quote a price on the phone.
+  // Commercial figures are calculated only by the server. Until an edited
+  // quantity, price, or discount is saved, the UI shows an explicit stale-total
+  // guardrail instead of performing browser floating-point arithmetic.
   if (e.target.id && (
-    e.target.id.startsWith('qty-') || e.target.id.startsWith('price-') || e.target.id === 'discountAmount'
-  )) flexRefreshTotals();
+    e.target.id.startsWith('qty-') || e.target.id.startsWith('unit-') ||
+    e.target.id.startsWith('price-') || e.target.id === 'discountAmount'
+  )) {
+    commercialEditsPending = true;
+    flexRefreshTotals();
+  }
 });
 document.addEventListener('click', (e) => {
   const opt = e.target.closest('.combo .opt');

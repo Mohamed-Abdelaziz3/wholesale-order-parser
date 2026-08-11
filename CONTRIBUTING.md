@@ -17,11 +17,9 @@ python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 ruff check app tests serve_demo.py
-pytest --ignore=tests/test_live_gemini.py
+pytest
 pip-audit -r requirements.txt
 ```
-
-The live Gemini test is opt-in because it uses a real API key and quota.
 
 ## Pull requests
 

@@ -12,7 +12,7 @@ from app.catalog import load_catalog
 from app.extractor import MockExtractor
 from app.main import create_app
 from app.models import ExtractedItem, ExtractionResult
-from tests.helpers import login
+from tests.helpers import login, process_payload
 
 MESSAGE = "ابعتلي 6 فلاش ليمون"
 PREDEFINED = {
@@ -91,7 +91,7 @@ def approve(client: TestClient, order_id, payload=None):
 
 
 def process_one(client: TestClient, message: str = MESSAGE):
-    response = client.post("/api/process", json={"message": message})
+    response = client.post("/api/process", json=process_payload(message))
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -110,11 +110,14 @@ def test_item_review_and_actor_audit(workflow):
     result = process_one(client)
     response = client.post(
         f"/api/orders/{result['order_id']}/items/{result['items'][0]['id']}/review",
-        json=review_payload(quantity=10.0, unit="كرتونة"),
+        json=review_payload(quantity=10.0, unit="قطعة"),
     )
     assert response.status_code == 200, response.text
     item = response.json()["items"][0]
-    assert item["extracted_quantity"] == 10.0
+    # The raw customer request is immutable evidence; the reviewer decision is
+    # carried in dedicated final-commercial fields.
+    assert item["extracted_quantity"] == 6.0
+    assert item["final_quantity"] == 10.0
     assert item["human_actor"] == "workflow-reviewer"
     audit = client.get(f"/api/orders/{result['order_id']}/audit").json()
     selection = next(event for event in audit if event["event_type"] == "human_selected_final_sku")

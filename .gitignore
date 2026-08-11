@@ -41,11 +41,21 @@ htmlcov/
 # Local databases, SQLite sidecars, logs, and exports
 *.db
 *.db-*
+*-wal
+*-shm
+*-journal
 *.sqlite
+*.sqlite-*
 *.sqlite3
+*.sqlite3-*
 *.bak
 *.log
 exports/
+catalog-backups/
+pilot-smoke-checkpoint*.json
+live_test_results*.json
+operator_backups/
+forensic_preservation/
 live_test_*
 live_eval_*
 
@@ -72,3 +82,5 @@ evaluation/**/forensics/correction/
 evaluation/**/forensics/*.csv
 evaluation/**/forensics/*.json
 evaluation/**/retrieval_benchmark/*.csv
+evaluation/forensics/
+evaluation/reranker_benchmark/run_groq_reranker_v2.py

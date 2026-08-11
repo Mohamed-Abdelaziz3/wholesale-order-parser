@@ -9,6 +9,7 @@ remain safe under retries and concurrent requests.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from threading import Barrier
 from typing import Any
 
@@ -19,7 +20,7 @@ import app.main as main_module
 from app import database
 from app.main import create_app
 from app.models import ExtractedItem, ExtractionResult
-from tests.helpers import login
+from tests.helpers import login, process_payload
 
 ACTOR = "flex-reviewer"
 ALPHA_SKU = "A100"
@@ -81,7 +82,7 @@ def flexible_order(tmp_path, monkeypatch):
 
 
 def _new_order(client: TestClient) -> dict[str, Any]:
-    response = client.post("/api/process", json={"message": "flexibility test"})
+    response = client.post("/api/process", json=process_payload("flexibility test"))
     assert response.status_code == 200, response.text
     order = response.json()
     assert len(order["items"]) == 2
@@ -674,7 +675,9 @@ def test_concurrent_flexibility_writes_are_serializable_and_leave_no_partial_sta
     assert [result[0] for result in override_results] == [200, 200]
     raced = database.get_order_by_id(order_id, db_path)
     alpha = next(item for item in raced["items"] if item["id"] == alpha_id)
-    assert alpha["price_override"] in {7.5, 8.5}
+    # Database storage is canonical Decimal text; the HTTP response remains a
+    # stable number for the browser, while direct persistence never uses REAL.
+    assert alpha["price_override"] in {"7.50", "8.50"}
     price_events = [
         event
         for event in raced["audit_events"]
@@ -683,7 +686,7 @@ def test_concurrent_flexibility_writes_are_serializable_and_leave_no_partial_sta
     assert {event["action_id"] for event in price_events} == {first_action, second_action}
     approved = _approve(client, order_id, f"race-price-approve-{order_id}")
     frozen = next(row for row in approved["snapshot"] if row["original_item_id"] == alpha_id)
-    assert frozen["price"] == pytest.approx(alpha["price_override"])
+    assert Decimal(str(frozen["price"])) == Decimal(alpha["price_override"])
 
     # Two different approval action IDs racing must still create one snapshot
     # per source line and one order_approved audit event.

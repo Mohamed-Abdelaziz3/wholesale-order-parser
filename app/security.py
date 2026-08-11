@@ -6,9 +6,9 @@ Design contract
   authenticated session**, never from the request body. A body-supplied
   ``actor`` is still required (it keeps the explicit-intent contract) but it is
   rejected with 403 when it disagrees with the session identity.
-* Authentication is enforced by default. If no password is configured the
-  application generates a random one at startup and prints it, instead of
-  silently running open to the internet.
+* Authentication is enforced by default. Development may generate a temporary
+  in-memory credential to avoid an unauthenticated server, but it is never
+  printed. Production refuses to start without explicit named credentials.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import quote, urlsplit
 
 from fastapi import HTTPException, Request, status
+
+from .runtime_config import is_production, validate_production_authentication
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +83,7 @@ def _parse_users(raw: str) -> Dict[str, str]:
             continue
         if ":" not in chunk:
             raise ValueError(
-                "APP_USERS entries must look like 'name:password'; "
-                f"received {chunk!r}"
+                "APP_USERS entries must look like 'name:password'"
             )
         name, password = chunk.split(":", 1)
         name, password = name.strip(), password.strip()
@@ -95,6 +96,10 @@ def _parse_users(raw: str) -> Dict[str, str]:
 def load_auth_config(env: Optional[Dict[str, str]] = None) -> AuthConfig:
     """Build an :class:`AuthConfig` from the environment, failing safe."""
     source = os.environ if env is None else env
+
+    # This runs before any fallback generation. A production process cannot
+    # become reachable with an unknown password or restart-ephemeral sessions.
+    validate_production_authentication(source)
 
     users = _parse_users(source.get("APP_USERS", "") or "")
     shared = (source.get("APP_PASSWORD") or "").strip() or None
@@ -126,17 +131,16 @@ def load_auth_config(env: Optional[Dict[str, str]] = None) -> AuthConfig:
 
 
 def announce(config: AuthConfig) -> None:
-    """Log startup credentials exactly once, loudly, when auto-generated."""
+    """Log configuration warnings without ever disclosing a credential."""
+    if is_production() and (config.generated_password or config.generated_secret):
+        # ``load_auth_config`` should already have rejected this; retain a
+        # defence-in-depth guard for alternate construction paths.
+        raise RuntimeError("Production authentication configuration generated a fallback")
     if config.generated_password:
         logger.warning(
-            "\n"
-            "==========================================================\n"
-            " No APP_PASSWORD / APP_USERS was configured.\n"
-            " A temporary password was generated for this process:\n\n"
-            "     %s\n\n"
-            " Set APP_PASSWORD (or APP_USERS) before any real deployment.\n"
-            "==========================================================",
-            config.shared_password,
+            "No APP_PASSWORD / APP_USERS was configured. A development-only "
+            "temporary credential was generated but intentionally not logged. "
+            "Set explicit credentials before using the application."
         )
     if config.generated_secret:
         logger.warning(
@@ -232,16 +236,12 @@ def csrf_violation(request: Request) -> Optional[str]:
 def client_key(request: Request) -> str:
     """Throttle key for the caller's network address.
 
-    ``X-Forwarded-For`` is attacker-controlled unless a trusted proxy sets it.
-    Honouring it unconditionally turned the login throttle into decoration: an
-    attacker rotates the header per request and never trips the counter. It is
-    now used only when the deployment explicitly declares it is behind a proxy.
+    Raw ``X-Forwarded-For`` is attacker-controlled.  Uvicorn's proxy middleware
+    is the only component allowed to consume it, and only after it verifies the
+    TCP peer against ``FORWARDED_ALLOW_IPS``.  It then updates
+    ``request.client``; using that value here avoids a second, weaker trust
+    decision in application code.
     """
-    trust = (os.getenv("TRUST_PROXY_HEADERS", "false") or "").strip().lower()
-    if trust in {"1", "true", "yes", "on"}:
-        forwarded = request.headers.get("x-forwarded-for", "")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 

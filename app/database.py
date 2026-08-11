@@ -6,18 +6,60 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from os import PathLike
 from typing import Any, Dict, Iterator, List, Optional, Union
 from urllib.parse import quote
 
-from dotenv import load_dotenv
+from .catalog_backups import (
+    DEFAULT_RETENTION as CATALOG_BACKUP_RETENTION,
+)
+from .catalog_backups import (
+    CatalogBackupError,
+    CatalogBackupIntegrityError,
+    CatalogBackupMissingError,
+    CatalogBackupUnavailableError,
+    read_snapshot,
+    snapshot_path,
+    write_snapshot,
+)
+from .catalog_backups import (
+    canonical_rows as canonical_catalog_rows,
+)
+from .catalog_backups import (
+    content_sha256 as catalog_content_sha256,
+)
+from .money import (
+    ZERO,
+    from_storage,
+    legacy_to_storage,
+    line_total,
+    money_sum,
+    parse_money,
+    to_storage,
+)
+from .runtime_config import load_runtime_environment
+from .units import (
+    UNIT_CHECK_EQUIVALENT,
+    UNIT_CHECK_HUMAN_OVERRIDE,
+    UNIT_CHECK_LEGACY_APPROVED,
+    UNIT_CHECK_LEGACY_UNVERIFIED,
+    UNIT_CHECK_MANUAL_CATALOG,
+    UNIT_CHECK_PENDING,
+    classify_unit_check,
+    unit_check_is_approval_ready,
+    unit_check_requires_resolution,
+    units_equivalent,
+)
 
-load_dotenv()
-if os.name == "nt":
-    load_dotenv(r"C:\ProgramData\wop\.env")
+# Never search the repository working directory for a .env file.  This module
+# is imported independently by maintenance commands/tests as well as the app
+# factory, so it enforces the same explicit machine-local configuration rule.
+load_runtime_environment()
 
 DB_PATH = os.getenv("ORDERS_DB_PATH") or os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "orders.db"
@@ -31,6 +73,15 @@ MODEL_STATUSES = {"needs_review", "unresolved", "ambiguous"}
 HUMAN_DECISIONS = {"SELECT", "NOT_FOUND", "CANCELLED"}
 MIGRATION_ID = "2026_07_27_human_approval_provenance_v2"
 ORDER_FLEXIBILITY_MIGRATION_ID = "2026_08_01_order_flexibility_v1"
+PROCESS_IDEMPOTENCY_MIGRATION_ID = "2026_08_09_process_request_idempotency_v1"
+MONEY_MIGRATION_ID = "2026_08_09_decimal_text_money_v1"
+UNIT_SAFETY_MIGRATION_ID = "2026_08_09_unit_mismatch_fail_closed_v1"
+CATALOG_BACKUP_AVAILABILITY_MIGRATION_ID = "2026_08_11_catalog_backup_availability_v1"
+PROCESS_REQUEST_LEASE_SECONDS = 90
+
+CATALOG_BACKUP_AVAILABLE = "AVAILABLE"
+CATALOG_BACKUP_MISSING = "MISSING"
+CATALOG_BACKUP_CORRUPT = "CORRUPT"
 
 FINAL_ITEM_STATUSES = {"human_selected", "not_found_confirmed", "cancelled_by_human"}
 CUSTOMER_FIELD_LIMITS = {
@@ -146,7 +197,16 @@ def _create_safe_approved_table(conn: sqlite3.Connection, table: str) -> None:
             product_name TEXT NOT NULL,
             quantity REAL NOT NULL,
             unit TEXT NOT NULL,
-            price REAL NOT NULL,
+            requested_unit TEXT,
+            catalog_unit TEXT,
+            unit_check_status TEXT NOT NULL DEFAULT 'LEGACY_APPROVED',
+            unit_resolution TEXT,
+            unit_resolution_note TEXT,
+            unit_resolution_actor TEXT,
+            unit_resolved_at TEXT,
+            unit_resolution_action_id TEXT,
+            price TEXT NOT NULL,
+            line_total TEXT NOT NULL DEFAULT '0.00',
             confidence REAL NOT NULL,
             model_recommendation_id TEXT,
             model_decision TEXT,
@@ -160,8 +220,8 @@ def _create_safe_approved_table(conn: sqlite3.Connection, table: str) -> None:
             provenance_verified INTEGER NOT NULL DEFAULT 0,
             is_manually_corrected INTEGER NOT NULL DEFAULT 0,
             is_human_confirmed INTEGER NOT NULL DEFAULT 0,
-            catalog_price REAL,
-            price_override REAL,
+            catalog_price TEXT,
+            price_override TEXT,
             price_overridden INTEGER NOT NULL DEFAULT 0,
             price_override_actor TEXT,
             price_overridden_at TEXT,
@@ -407,6 +467,337 @@ def apply_human_review_migration(db_path: DatabasePath) -> Dict[str, Any]:
     return verify_human_review_migration(db_path)
 
 
+# ---------------------------------------------------------------------------
+# Decimal-text money migration
+#
+# SQLite cannot alter a column affinity in place.  These tables are therefore
+# rebuilt as one verified transaction rather than carrying a second set of
+# ``*_minor`` / legacy columns forever.  Existing REAL values are copied as the
+# exact human-visible Decimal spelling returned by SQLite; they are never
+# rounded during migration.  New writes use ``money.to_storage`` (two places).
+# ---------------------------------------------------------------------------
+
+_MONEY_COLUMNS = {
+    "catalog_products": {"price"},
+    "orders": {"discount"},
+    "order_items": {
+        "matched_price",
+        "recommendation_price",
+        "catalog_price",
+        "price_override",
+    },
+    "approved_order_items": {"price", "catalog_price", "price_override", "line_total"},
+    "approved_order_financials": {"subtotal", "discount", "grand_total"},
+}
+
+
+def _money_schema_needs_migration(conn: sqlite3.Connection) -> bool:
+    for table, fields in _MONEY_COLUMNS.items():
+        columns = _columns(conn, table)
+        if not columns:
+            continue
+        for field in fields:
+            column = columns.get(field)
+            if column is None or str(column["type"] or "").upper() != "TEXT":
+                return True
+    return False
+
+
+def preflight_money_migration(
+    db_path: Optional[DatabasePath] = None,
+) -> Dict[str, Any]:
+    """Report legacy money scale/schema without changing the database."""
+    path = resolve_db_path(db_path)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return {
+            "database_path": path,
+            "needs_migration": False,
+            "legacy_values_over_two_places": [],
+        }
+    conn = sqlite3.connect(_read_only_uri(path), uri=True)
+    conn.row_factory = sqlite3.Row
+    findings: list[Dict[str, Any]] = []
+    try:
+        needs_migration = _money_schema_needs_migration(conn)
+        for table, fields in _MONEY_COLUMNS.items():
+            columns = _columns(conn, table)
+            if not columns:
+                continue
+            for field in fields:
+                if field not in columns:
+                    continue
+                for row in conn.execute(
+                    f"SELECT rowid AS _rowid, {field} FROM {table} WHERE {field} IS NOT NULL"  # noqa: S608 - static migration schema names
+                ):
+                    try:
+                        amount = from_storage(row[field], f"{table}.{field}")
+                    except ValueError:
+                        findings.append(
+                            {
+                                "table": table,
+                                "column": field,
+                                "rowid": row["_rowid"],
+                                "value": str(row[field]),
+                                "issue": "invalid",
+                            }
+                        )
+                        continue
+                    if amount.as_tuple().exponent < -2:
+                        findings.append(
+                            {
+                                "table": table,
+                                "column": field,
+                                "rowid": row["_rowid"],
+                                "value": legacy_to_storage(amount),
+                                "issue": "more_than_two_places",
+                            }
+                        )
+        return {
+            "database_path": path,
+            "needs_migration": needs_migration,
+            "legacy_values_over_two_places": findings,
+        }
+    finally:
+        conn.close()
+
+
+def _create_money_orders_table(conn: sqlite3.Connection, table: str) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE {table} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_text TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'needs_review',
+            export_count INTEGER NOT NULL DEFAULT 0,
+            last_exported_at TEXT,
+            processing_time_ms REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            approved_at TEXT,
+            customer_name TEXT,
+            customer_phone TEXT,
+            customer_address TEXT,
+            discount TEXT NOT NULL DEFAULT '0.00'
+        )
+        """
+    )
+
+
+def _create_money_order_items_table(conn: sqlite3.Connection, table: str) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE {table} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            raw_text TEXT NOT NULL,
+            extracted_product TEXT NOT NULL,
+            extracted_quantity REAL NOT NULL,
+            extracted_unit TEXT NOT NULL,
+            requested_unit TEXT,
+            final_quantity REAL,
+            final_unit TEXT,
+            unit_check_status TEXT NOT NULL DEFAULT 'PENDING_CATALOG_SELECTION',
+            unit_resolution TEXT,
+            unit_resolution_note TEXT,
+            unit_resolution_actor TEXT,
+            unit_resolved_at TEXT,
+            unit_resolution_action_id TEXT,
+            matched_product_id TEXT,
+            matched_product_name TEXT,
+            matched_unit TEXT,
+            matched_price TEXT,
+            recommendation_product_id TEXT,
+            recommendation_product_name TEXT,
+            recommendation_unit TEXT,
+            recommendation_price TEXT,
+            recommendation_decision TEXT,
+            confidence REAL NOT NULL DEFAULT 0.0,
+            status TEXT NOT NULL DEFAULT 'needs_review',
+            is_manually_corrected INTEGER NOT NULL DEFAULT 0,
+            is_human_confirmed INTEGER NOT NULL DEFAULT 0,
+            human_decision TEXT,
+            human_selected_sku TEXT,
+            human_actor TEXT,
+            human_confirmed_at TEXT,
+            review_action_id TEXT,
+            catalog_price TEXT,
+            price_override TEXT,
+            price_overridden INTEGER NOT NULL DEFAULT 0,
+            price_override_actor TEXT,
+            price_overridden_at TEXT,
+            price_override_action_id TEXT,
+            candidates_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
+def _create_money_catalog_table(conn: sqlite3.Connection, table: str) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE {table} (
+            product_id TEXT PRIMARY KEY,
+            product_name TEXT NOT NULL,
+            aliases TEXT NOT NULL DEFAULT '',
+            unit TEXT NOT NULL DEFAULT '',
+            price TEXT NOT NULL DEFAULT '0.00',
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def _create_money_financials_table(conn: sqlite3.Connection, table: str) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE {table} (
+            order_id INTEGER PRIMARY KEY,
+            customer_name TEXT,
+            customer_phone TEXT,
+            customer_address TEXT,
+            subtotal TEXT NOT NULL,
+            discount TEXT NOT NULL,
+            grand_total TEXT NOT NULL,
+            approved_at TEXT NOT NULL,
+            FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+        )
+        """
+    )
+
+
+def _insert_row(cursor: sqlite3.Cursor, table: str, row: Dict[str, Any]) -> None:
+    columns = list(row)
+    placeholders = ", ".join("?" for _ in columns)
+    cursor.execute(
+        f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",  # noqa: S608 - table/columns are migration-internal
+        [row[column] for column in columns],
+    )
+
+
+def _legacy_money_value(row: Dict[str, Any], field: str, *, default: Optional[str] = None) -> Optional[str]:
+    value = row.get(field)
+    if value is None:
+        return default
+    return legacy_to_storage(value, field)
+
+
+def _apply_money_schema_migration(db_path: Optional[DatabasePath] = None) -> None:
+    """Replace legacy REAL commercial columns with Decimal-text tables.
+
+    This deliberately runs outside :func:`session`: SQLite requires
+    ``foreign_keys`` to be disabled before the transaction that replaces parent
+    tables.  The transaction is still ``BEGIN IMMEDIATE`` and ends with
+    ``foreign_key_check`` before commit.
+    """
+    path = resolve_db_path(db_path)
+    conn = sqlite3.connect(path, timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA foreign_keys=OFF")
+        if not _money_schema_needs_migration(conn):
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (MONEY_MIGRATION_ID, utc_now_iso()),
+            )
+            conn.commit()
+            return
+
+        conn.execute("BEGIN IMMEDIATE")
+        source = {
+            table: [dict(row) for row in conn.execute(f"SELECT * FROM {table}")]  # noqa: S608 - table comes only from _MONEY_COLUMNS
+            for table in _MONEY_COLUMNS
+        }
+        cursor = conn.cursor()
+        for table in (
+            "orders__money_new",
+            "order_items__money_new",
+            "catalog_products__money_new",
+            "approved_order_items__money_new",
+            "approved_order_financials__money_new",
+        ):
+            cursor.execute(f"DROP TABLE IF EXISTS {table}")
+        _create_money_orders_table(conn, "orders__money_new")
+        _create_money_order_items_table(conn, "order_items__money_new")
+        _create_money_catalog_table(conn, "catalog_products__money_new")
+        _create_safe_approved_table(conn, "approved_order_items__money_new")
+        _create_money_financials_table(conn, "approved_order_financials__money_new")
+
+        for original in source["orders"]:
+            row = dict(original)
+            row["discount"] = _legacy_money_value(row, "discount", default="0.00")
+            _insert_row(cursor, "orders__money_new", row)
+        for original in source["order_items"]:
+            row = dict(original)
+            for field in (
+                "matched_price",
+                "recommendation_price",
+                "catalog_price",
+                "price_override",
+            ):
+                row[field] = _legacy_money_value(row, field)
+            _insert_row(cursor, "order_items__money_new", row)
+        for original in source["catalog_products"]:
+            row = dict(original)
+            row["price"] = _legacy_money_value(row, "price", default="0.00")
+            _insert_row(cursor, "catalog_products__money_new", row)
+        for original in source["approved_order_items"]:
+            row = dict(original)
+            for field in ("price", "catalog_price", "price_override"):
+                row[field] = _legacy_money_value(row, field)
+            # ``line_total`` did not exist before this migration.  It is a
+            # derived frozen field and does not modify the legacy unit price or
+            # quantity evidence.
+            row["line_total"] = to_storage(line_total(row["price"], row["quantity"]))
+            _insert_row(cursor, "approved_order_items__money_new", row)
+        for original in source["approved_order_financials"]:
+            row = dict(original)
+            for field in ("subtotal", "discount", "grand_total"):
+                row[field] = _legacy_money_value(row, field, default="0.00")
+            _insert_row(cursor, "approved_order_financials__money_new", row)
+
+        # Child tables retain foreign keys by name.  Recreating the same names
+        # under a single transaction preserves their targets and all IDs.
+        for table in (
+            "approved_order_items",
+            "approved_order_financials",
+            "order_items",
+            "orders",
+            "catalog_products",
+        ):
+            cursor.execute(f"DROP TABLE {table}")
+        for new, live in (
+            ("orders__money_new", "orders"),
+            ("order_items__money_new", "order_items"),
+            ("catalog_products__money_new", "catalog_products"),
+            ("approved_order_items__money_new", "approved_order_items"),
+            ("approved_order_financials__money_new", "approved_order_financials"),
+        ):
+            cursor.execute(f"ALTER TABLE {new} RENAME TO {live}")
+        problems = list(cursor.execute("PRAGMA foreign_key_check"))
+        if problems:
+            raise RuntimeError(f"Money migration foreign-key check failed: {problems[:3]}")
+        cursor.execute(
+            "INSERT OR REPLACE INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+            (MONEY_MIGRATION_ID, utc_now_iso()),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        try:
+            conn.execute("PRAGMA foreign_keys=ON")
+        except sqlite3.Error:
+            pass
+        conn.close()
+
+
 def init_db(db_path: Optional[DatabasePath] = None) -> None:
     """Initialize fresh schema and apply the forward provenance migration."""
     with session(db_path) as conn:
@@ -425,7 +816,7 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                 customer_name TEXT,
                 customer_phone TEXT,
                 customer_address TEXT,
-                discount REAL NOT NULL DEFAULT 0.0
+                discount TEXT NOT NULL DEFAULT '0.00'
             );
             CREATE TABLE IF NOT EXISTS order_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -434,14 +825,23 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                 extracted_product TEXT NOT NULL,
                 extracted_quantity REAL NOT NULL,
                 extracted_unit TEXT NOT NULL,
+                requested_unit TEXT,
+                final_quantity REAL,
+                final_unit TEXT,
+                unit_check_status TEXT NOT NULL DEFAULT 'PENDING_CATALOG_SELECTION',
+                unit_resolution TEXT,
+                unit_resolution_note TEXT,
+                unit_resolution_actor TEXT,
+                unit_resolved_at TEXT,
+                unit_resolution_action_id TEXT,
                 matched_product_id TEXT,
                 matched_product_name TEXT,
                 matched_unit TEXT,
-                matched_price REAL,
+                matched_price TEXT,
                 recommendation_product_id TEXT,
                 recommendation_product_name TEXT,
                 recommendation_unit TEXT,
-                recommendation_price REAL,
+                recommendation_price TEXT,
                 recommendation_decision TEXT,
                 confidence REAL NOT NULL DEFAULT 0.0,
                 status TEXT NOT NULL DEFAULT 'needs_review',
@@ -452,8 +852,8 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                 human_actor TEXT,
                 human_confirmed_at TEXT,
                 review_action_id TEXT,
-                catalog_price REAL,
-                price_override REAL,
+                catalog_price TEXT,
+                price_override TEXT,
                 price_overridden INTEGER NOT NULL DEFAULT 0,
                 price_override_actor TEXT,
                 price_overridden_at TEXT,
@@ -494,6 +894,21 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                 timestamp TEXT NOT NULL,
                 FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS process_requests (
+                action_id TEXT PRIMARY KEY,
+                actor TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('processing', 'succeeded', 'failed')),
+                claim_token TEXT,
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                order_id INTEGER UNIQUE,
+                failure_code TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (order_id) REFERENCES orders(id)
+            );
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 migration_id TEXT PRIMARY KEY,
                 applied_at TEXT NOT NULL
@@ -503,7 +918,7 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                 product_name TEXT NOT NULL,
                 aliases TEXT NOT NULL DEFAULT '',
                 unit TEXT NOT NULL DEFAULT '',
-                price REAL NOT NULL DEFAULT 0.0,
+                price TEXT NOT NULL DEFAULT '0.00',
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
@@ -513,7 +928,22 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                 source_name TEXT,
                 content_sha256 TEXT NOT NULL,
                 actor TEXT,
+                operation TEXT NOT NULL DEFAULT 'replace',
+                source_backup_id TEXT,
                 created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS catalog_backups (
+                backup_id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL UNIQUE,
+                source_catalog_version INTEGER,
+                product_count INTEGER NOT NULL,
+                content_sha256 TEXT NOT NULL,
+                actor TEXT,
+                created_at TEXT NOT NULL,
+                availability_status TEXT NOT NULL DEFAULT 'AVAILABLE'
+                    CHECK (availability_status IN ('AVAILABLE', 'MISSING', 'CORRUPT')),
+                availability_reason TEXT,
+                availability_changed_at TEXT
             );
             CREATE TABLE IF NOT EXISTS shop_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -532,9 +962,9 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                 customer_name TEXT,
                 customer_phone TEXT,
                 customer_address TEXT,
-                subtotal REAL NOT NULL,
-                discount REAL NOT NULL,
-                grand_total REAL NOT NULL,
+                subtotal TEXT NOT NULL,
+                discount TEXT NOT NULL,
+                grand_total TEXT NOT NULL,
                 approved_at TEXT NOT NULL,
                 FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
             );
@@ -546,10 +976,21 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                 conn,
                 "order_items",
                 {
+                    # The raw customer-requested unit never changes after model
+                    # ingestion. Human commercial choices are kept separately.
+                    "requested_unit": "TEXT",
+                    "final_quantity": "REAL",
+                    "final_unit": "TEXT",
+                    "unit_check_status": "TEXT NOT NULL DEFAULT 'PENDING_CATALOG_SELECTION'",
+                    "unit_resolution": "TEXT",
+                    "unit_resolution_note": "TEXT",
+                    "unit_resolution_actor": "TEXT",
+                    "unit_resolved_at": "TEXT",
+                    "unit_resolution_action_id": "TEXT",
                     "recommendation_product_id": "TEXT",
                     "recommendation_product_name": "TEXT",
                     "recommendation_unit": "TEXT",
-                    "recommendation_price": "REAL",
+                    "recommendation_price": "TEXT",
                     "recommendation_decision": "TEXT",
                     "is_human_confirmed": "INTEGER NOT NULL DEFAULT 0",
                     "human_decision": "TEXT",
@@ -560,13 +1001,29 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                     # matched_price is retained for compatibility.  The
                     # explicit fields below make the current catalogue price
                     # and a negotiated effective price independently auditable.
-                    "catalog_price": "REAL",
-                    "price_override": "REAL",
+                    "catalog_price": "TEXT",
+                    "price_override": "TEXT",
                     "price_overridden": "INTEGER NOT NULL DEFAULT 0",
                     "price_override_actor": "TEXT",
                     "price_overridden_at": "TEXT",
                     "price_override_action_id": "TEXT",
                 },
+            )
+            # Releases before this safety barrier reused ``extracted_unit`` for
+            # the final reviewer choice.  A NULL dedicated request-evidence
+            # field therefore means we cannot prove what the customer asked
+            # for, even when the remaining value happens to look compatible.
+            # New ingestion stores an empty string for a genuinely missing
+            # unit, so this affects only legacy rows and makes them visibly
+            # fail closed until a reviewer records a fresh decision.
+            conn.execute(
+                """
+                UPDATE order_items
+                SET unit_check_status=?
+                WHERE requested_unit IS NULL
+                  AND unit_check_status=?
+                """,
+                (UNIT_CHECK_LEGACY_UNVERIFIED, UNIT_CHECK_PENDING),
             )
             _ensure_columns(
                 conn,
@@ -575,13 +1032,41 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                     "customer_name": "TEXT",
                     "customer_phone": "TEXT",
                     "customer_address": "TEXT",
-                    "discount": "REAL NOT NULL DEFAULT 0.0",
+                    "discount": "TEXT NOT NULL DEFAULT '0.00'",
                 },
             )
             _ensure_columns(
                 conn,
                 "audit_events",
                 {"actor": "TEXT", "action_id": "TEXT"},
+            )
+            _ensure_columns(
+                conn,
+                "catalog_versions",
+                {
+                    "operation": "TEXT NOT NULL DEFAULT 'replace'",
+                    "source_backup_id": "TEXT",
+                },
+            )
+            _ensure_columns(
+                conn,
+                "catalog_backups",
+                {
+                    # Older pilot databases have only a file pointer. Preserve
+                    # it as an initially unverified recovery candidate, then
+                    # reconcile it before any future catalog replacement.
+                    "availability_status": "TEXT NOT NULL DEFAULT 'AVAILABLE'",
+                    "availability_reason": "TEXT",
+                    "availability_changed_at": "TEXT",
+                },
+            )
+            conn.execute(
+                """
+                UPDATE catalog_backups
+                SET availability_status=?
+                WHERE availability_status IS NULL OR TRIM(availability_status) = ''
+                """,
+                (CATALOG_BACKUP_AVAILABLE,),
             )
             # Shop identity arrived after the first deployments. Forward-migrate
             # rather than recreate, so an existing database keeps its orders.
@@ -607,17 +1092,38 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
                 conn,
                 "approved_order_items",
                 {
-                    "catalog_price": "REAL",
-                    "price_override": "REAL",
+                    "requested_unit": "TEXT",
+                    "catalog_unit": "TEXT",
+                    "unit_check_status": "TEXT NOT NULL DEFAULT 'LEGACY_APPROVED'",
+                    "unit_resolution": "TEXT",
+                    "unit_resolution_note": "TEXT",
+                    "unit_resolution_actor": "TEXT",
+                    "unit_resolved_at": "TEXT",
+                    "unit_resolution_action_id": "TEXT",
+                    "catalog_price": "TEXT",
+                    "price_override": "TEXT",
                     "price_overridden": "INTEGER NOT NULL DEFAULT 0",
                     "price_override_actor": "TEXT",
                     "price_overridden_at": "TEXT",
                     "price_override_action_id": "TEXT",
+                    "line_total": "TEXT NOT NULL DEFAULT '0.00'",
                 },
             )
             conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
                 (ORDER_FLEXIBILITY_MIGRATION_ID, utc_now_iso()),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (PROCESS_IDEMPOTENCY_MIGRATION_ID, utc_now_iso()),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (UNIT_SAFETY_MIGRATION_ID, utc_now_iso()),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at) VALUES (?, ?)",
+                (CATALOG_BACKUP_AVAILABILITY_MIGRATION_ID, utc_now_iso()),
             )
             conn.execute("RELEASE SAVEPOINT human_review_forward_migration")
         except Exception:
@@ -626,6 +1132,10 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
             raise
         conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_order ON audit_events(order_id, id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_events(action_id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_process_requests_state_lease "
+            "ON process_requests(state, lease_expires_at)"
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_items_order ON order_items(order_id, id)")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC, id DESC)"
@@ -640,6 +1150,23 @@ def init_db(db_path: Optional[DatabasePath] = None) -> None:
             "CREATE INDEX IF NOT EXISTS idx_catalog_sort ON catalog_products(sort_order, product_id)"
         )
         conn.commit()
+    _apply_money_schema_migration(db_path)
+    # Rebuilding SQLite tables removes their indexes. Reassert the small set of
+    # request-path indexes after the money migration (a no-op for fresh DBs).
+    with session(db_path) as conn:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_items_order ON order_items(order_id, id)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at DESC, id DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_customer_name ON orders(customer_name)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_customer_phone ON orders(customer_phone)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_catalog_sort ON catalog_products(sort_order, product_id)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +1300,392 @@ def load_catalog_rows(db_path: Optional[DatabasePath] = None) -> List[Dict[str, 
         ]
 
 
+def _prepare_catalog_products(
+    products: List[Dict[str, Any]],
+    *,
+    allow_legacy_prices: bool = False,
+) -> list[Dict[str, Any]]:
+    """Validate catalog rows before acquiring the destructive replacement lock.
+
+    Uploaded catalog values are new commercial input and must meet the current
+    two-decimal invariant. A validated recovery snapshot is different: it may
+    contain a pre-pilot legacy price with more than two places, which must be
+    restored exactly rather than silently rounded or rejected as new input.
+    """
+    if not products:
+        raise ValueError("Cannot install an empty catalog")
+    seen: set[str] = set()
+    prepared: list[Dict[str, Any]] = []
+    for index, source in enumerate(products):
+        record = dict(source)
+        product_id = _require_text(record.get("product_id"), "Catalog SKU")
+        product_name = _require_text(record.get("product_name"), "Catalog product name")
+        unit = _require_text(record.get("unit"), "Catalog unit")
+        if product_id in seen:
+            raise ValueError(f"Catalog contains duplicate SKU '{product_id}'")
+        seen.add(product_id)
+        aliases_source = record.get("aliases") or []
+        aliases = (
+            [part for part in str(aliases_source).split("|") if part]
+            if isinstance(aliases_source, str)
+            else [str(part).strip() for part in aliases_source if str(part).strip()]
+        )
+        price = (
+            legacy_to_storage(record.get("price"), "Catalog price")
+            if allow_legacy_prices
+            else to_storage(parse_money(record.get("price"), "Catalog price"))
+        )
+        prepared.append(
+            {
+                "product_id": product_id,
+                "product_name": product_name,
+                "aliases": aliases,
+                "unit": unit,
+                "price": price,
+                "sort_order": int(record.get("sort_order", index) or 0),
+            }
+        )
+    return canonical_catalog_rows(prepared)
+
+
+def _catalog_rows_tx(cursor: sqlite3.Cursor) -> list[Dict[str, Any]]:
+    return [
+        {
+            "product_id": row["product_id"],
+            "product_name": row["product_name"],
+            "aliases": [part for part in (row["aliases"] or "").split("|") if part],
+            "unit": row["unit"],
+            "price": row["price"],
+            "sort_order": row["sort_order"],
+        }
+        for row in cursor.execute(
+            "SELECT * FROM catalog_products ORDER BY sort_order, product_id"
+        )
+    ]
+
+
+def _catalog_backup_failure_state(error: CatalogBackupError) -> tuple[str, str]:
+    """Return the durable availability state for a failed snapshot inspection."""
+    if isinstance(error, CatalogBackupMissingError):
+        return CATALOG_BACKUP_MISSING, "Snapshot file is missing"
+    if isinstance(error, CatalogBackupIntegrityError):
+        return CATALOG_BACKUP_CORRUPT, "Snapshot integrity validation failed"
+    if isinstance(error, CatalogBackupUnavailableError):
+        raise RuntimeError("Catalog backup could not be inspected safely") from error
+    # A permissions or I/O failure is neither proof that the snapshot is gone
+    # nor proof that its contents changed. Do not permanently retire a valid
+    # recovery point during a transient outage; fail this catalog operation so
+    # the operator can retry once the storage fault is resolved.
+    raise RuntimeError("Catalog backup could not be inspected safely") from error
+
+
+def _validate_catalog_backup_record(
+    metadata: Dict[str, Any],
+    *,
+    db_path: DatabasePath,
+) -> tuple[Optional[Dict[str, Any]], Optional[tuple[str, str]]]:
+    """Validate one tracked snapshot and classify only durable evidence.
+
+    The database row remains the audit record even when its recovery file is no
+    longer usable. Callers therefore receive a lifecycle state rather than an
+    exception for historical snapshot failures.
+    """
+    try:
+        manifest = read_snapshot(
+            db_path=db_path,
+            filename=metadata["filename"],
+            backup_id=metadata["backup_id"],
+        )
+    except CatalogBackupError as exc:
+        return None, _catalog_backup_failure_state(exc)
+    if (
+        manifest["product_count"] != metadata["product_count"]
+        or manifest["content_sha256"] != metadata["content_sha256"]
+    ):
+        return None, (
+            CATALOG_BACKUP_CORRUPT,
+            "Snapshot metadata does not match validated content",
+        )
+    return manifest, None
+
+
+def _mark_catalog_backup_unavailable_tx(
+    cursor: sqlite3.Cursor,
+    metadata: Dict[str, Any],
+    *,
+    status: str,
+    reason: str,
+    now: str,
+) -> None:
+    """Retire one unusable recovery point without erasing its audit evidence."""
+    if status not in {
+        CATALOG_BACKUP_MISSING,
+        CATALOG_BACKUP_CORRUPT,
+    }:
+        raise ValueError("Catalog backup availability status is invalid")
+    cursor.execute(
+        """
+        UPDATE catalog_backups
+        SET availability_status=?, availability_reason=?, availability_changed_at=?
+        WHERE backup_id=? AND availability_status=?
+        """,
+        (
+            status,
+            reason,
+            now,
+            metadata["backup_id"],
+            CATALOG_BACKUP_AVAILABLE,
+        ),
+    )
+
+
+def _reconcile_catalog_backup_availability_tx(
+    cursor: sqlite3.Cursor,
+    *,
+    db_path: DatabasePath,
+    now: str,
+) -> None:
+    """Persist immutable evidence for every newly discovered unavailable backup."""
+    records = [
+        dict(row)
+        for row in cursor.execute(
+            """
+            SELECT * FROM catalog_backups
+            WHERE availability_status=?
+            ORDER BY created_at DESC, backup_id DESC
+            """,
+            (CATALOG_BACKUP_AVAILABLE,),
+        )
+    ]
+    for metadata in records:
+        _, unavailable = _validate_catalog_backup_record(metadata, db_path=db_path)
+        if unavailable:
+            status, reason = unavailable
+            _mark_catalog_backup_unavailable_tx(
+                cursor,
+                metadata,
+                status=status,
+                reason=reason,
+                now=now,
+            )
+
+
+def _reconcile_catalog_backup_availability(db_path: Optional[DatabasePath] = None) -> None:
+    """Commit historical backup availability evidence before catalog mutation.
+
+    Snapshot files are outside SQLite's transaction boundary. Committing this
+    short reconciliation separately ensures a later catalog-write rollback can
+    never resurrect an already-discovered orphan as an active restore point.
+    """
+    resolved_db_path = resolve_db_path(db_path)
+    with session(resolved_db_path, immediate=True) as conn:
+        _reconcile_catalog_backup_availability_tx(
+            conn.cursor(),
+            db_path=resolved_db_path,
+            now=utc_now_iso(),
+        )
+
+
+def _insert_catalog_backup_metadata_tx(cursor: sqlite3.Cursor, snapshot: Dict[str, Any]) -> None:
+    cursor.execute(
+        """
+        INSERT INTO catalog_backups (
+            backup_id, filename, source_catalog_version, product_count,
+            content_sha256, actor, created_at, availability_status,
+            availability_reason, availability_changed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            snapshot["backup_id"],
+            snapshot["filename"],
+            snapshot.get("source_catalog_version"),
+            snapshot["product_count"],
+            snapshot["content_sha256"],
+            snapshot.get("actor"),
+            snapshot["created_at"],
+            CATALOG_BACKUP_AVAILABLE,
+            None,
+            snapshot["created_at"],
+        ),
+    )
+
+
+def _prune_catalog_backups_tx(
+    cursor: sqlite3.Cursor,
+    *,
+    db_path: Optional[DatabasePath],
+    now: str,
+) -> None:
+    """Prune only currently verified recovery points.
+
+    Missing and corrupted historical files become durable metadata states
+    instead of errors that undo a safe replacement. They are excluded from
+    restore and retention candidates but intentionally remain visible to
+    operators as evidence of the lost recovery point. Transient I/O failures
+    remain retryable and abort the current catalog operation safely.
+    """
+    resolved_db_path = resolve_db_path(db_path)
+    _reconcile_catalog_backup_availability_tx(
+        cursor,
+        db_path=resolved_db_path,
+        now=now,
+    )
+    while True:
+        records = [
+            dict(row)
+            for row in cursor.execute(
+                """
+                SELECT * FROM catalog_backups
+                WHERE availability_status=?
+                ORDER BY created_at DESC, backup_id DESC
+                """,
+                (CATALOG_BACKUP_AVAILABLE,),
+            )
+        ]
+        if len(records) <= CATALOG_BACKUP_RETENTION:
+            return
+
+        candidates = records[CATALOG_BACKUP_RETENTION:]
+        changed_availability = False
+        # Validate every target before deleting any file. A corrupted snapshot
+        # is evidence to retain, never a file to remove merely to unblock
+        # retention.
+        for metadata in candidates:
+            _, unavailable = _validate_catalog_backup_record(
+                metadata,
+                db_path=resolved_db_path,
+            )
+            if unavailable:
+                status, reason = unavailable
+                _mark_catalog_backup_unavailable_tx(
+                    cursor,
+                    metadata,
+                    status=status,
+                    reason=reason,
+                    now=now,
+                )
+                changed_availability = True
+        if changed_availability:
+            continue
+
+        for metadata in candidates:
+            try:
+                snapshot_path(
+                    db_path=resolved_db_path,
+                    filename=metadata["filename"],
+                ).unlink()
+            except FileNotFoundError:
+                _mark_catalog_backup_unavailable_tx(
+                    cursor,
+                    metadata,
+                    status=CATALOG_BACKUP_MISSING,
+                    reason="Snapshot file is missing",
+                    now=now,
+                )
+                changed_availability = True
+            except CatalogBackupError as exc:
+                status, reason = _catalog_backup_failure_state(exc)
+                _mark_catalog_backup_unavailable_tx(
+                    cursor,
+                    metadata,
+                    status=status,
+                    reason=reason,
+                    now=now,
+                )
+                changed_availability = True
+            except OSError as exc:
+                raise RuntimeError(
+                    "Catalog backup retention cleanup failed; catalog replacement was aborted"
+                ) from exc
+            else:
+                cursor.execute(
+                    "DELETE FROM catalog_backups WHERE backup_id=?",
+                    (metadata["backup_id"],),
+                )
+        if not changed_availability:
+            return
+
+
+def _replace_catalog_rows_tx(
+    cursor: sqlite3.Cursor,
+    products: list[Dict[str, Any]],
+    *,
+    source_name: Optional[str],
+    actor: Optional[str],
+    now: str,
+    operation: str,
+    source_backup_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Replace only catalog rows and append an attributable version record."""
+    digest = catalog_content_sha256(products)
+    cursor.execute("DELETE FROM catalog_products")
+    cursor.executemany(
+        """
+        INSERT INTO catalog_products
+            (product_id, product_name, aliases, unit, price, sort_order, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                product["product_id"],
+                product["product_name"],
+                "|".join(product.get("aliases") or []),
+                product["unit"],
+                product["price"],
+                index,
+                now,
+            )
+            for index, product in enumerate(products)
+        ],
+    )
+    cursor.execute(
+        """
+        INSERT INTO catalog_versions
+            (product_count, source_name, content_sha256, actor, operation, source_backup_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (len(products), source_name, digest, actor, operation, source_backup_id, now),
+    )
+    return {
+        "version_id": int(cursor.lastrowid),
+        "product_count": len(products),
+        "content_sha256": digest,
+        "installed_at": now,
+        "source_name": source_name,
+        "actor": actor,
+        "operation": operation,
+        "source_backup_id": source_backup_id,
+    }
+
+
+def _backup_current_catalog_tx(
+    cursor: sqlite3.Cursor,
+    *,
+    db_path: Optional[DatabasePath],
+    actor: Optional[str],
+    now: str,
+) -> Optional[Dict[str, Any]]:
+    current = _catalog_rows_tx(cursor)
+    if not current:
+        return None
+    version = cursor.execute("SELECT id FROM catalog_versions ORDER BY id DESC LIMIT 1").fetchone()
+    try:
+        snapshot = write_snapshot(
+            current,
+            db_path=resolve_db_path(db_path),
+            source_catalog_version=int(version["id"]) if version else None,
+            actor=actor,
+            created_at=now,
+        )
+    except CatalogBackupError as exc:
+        # The caller still holds the pre-replacement SQLite state. Raising here
+        # aborts before catalog_products is touched.
+        raise RuntimeError("Catalog backup failed; catalog replacement was aborted") from exc
+    _insert_catalog_backup_metadata_tx(cursor, snapshot)
+    _prune_catalog_backups_tx(cursor, db_path=db_path, now=now)
+    return snapshot
+
+
 def replace_catalog(
     products: List[Dict[str, Any]],
     db_path: Optional[DatabasePath] = None,
@@ -780,54 +1693,102 @@ def replace_catalog(
     source_name: Optional[str] = None,
     actor: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Atomically replace the entire catalog and record a version row."""
-    if not products:
-        raise ValueError("Cannot install an empty catalog")
-
+    """Atomically replace the catalog after a durable pre-replacement backup."""
+    normalised_products = _prepare_catalog_products(products)
+    # Reconciliation commits separately because snapshot files are outside the
+    # SQLite transaction. A later failed replacement must not make a known
+    # missing/corrupt recovery point appear active again.
+    _reconcile_catalog_backup_availability(db_path)
     now = utc_now_iso()
-    canonical = json.dumps(products, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
     with session(db_path, immediate=True) as conn:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM catalog_products")
-        cursor.executemany(
-            """
-            INSERT INTO catalog_products
-                (product_id, product_name, aliases, unit, price, sort_order, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    product["product_id"],
-                    product["product_name"],
-                    "|".join(product.get("aliases") or []),
-                    product.get("unit") or "",
-                    float(product.get("price") or 0.0),
-                    index,
-                    now,
-                )
-                for index, product in enumerate(products)
-            ],
+        _backup_current_catalog_tx(cursor, db_path=db_path, actor=actor, now=now)
+        return _replace_catalog_rows_tx(
+            cursor,
+            normalised_products,
+            source_name=source_name,
+            actor=actor,
+            now=now,
+            operation="replace",
         )
-        cursor.execute(
-            """
-            INSERT INTO catalog_versions
-                (product_count, source_name, content_sha256, actor, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (len(products), source_name, digest, actor, now),
-        )
-        version_id = int(cursor.lastrowid)
 
-    return {
-        "version_id": version_id,
-        "product_count": len(products),
-        "content_sha256": digest,
-        "installed_at": now,
-        "source_name": source_name,
-        "actor": actor,
-    }
+
+def list_catalog_backups(db_path: Optional[DatabasePath] = None) -> List[Dict[str, Any]]:
+    """List durable recovery points without exposing arbitrary filesystem paths."""
+    with session(db_path) as conn:
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM catalog_backups ORDER BY created_at DESC, backup_id DESC"
+            )
+        ]
+
+
+def restore_catalog_backup(
+    backup_id: str,
+    *,
+    actor: str,
+    db_path: Optional[DatabasePath] = None,
+) -> Dict[str, Any]:
+    """Restore one validated catalog-only snapshot, preserving all orders.
+
+    Operators must stop the one-replica app before calling this maintenance
+    function/CLI, then restart it so the live in-memory matcher reloads from
+    the restored catalog. The function intentionally accepts a durable backup
+    ID rather than a path supplied by an operator.
+    """
+    actor = _require_text(actor, "Restore actor")
+    backup_id = _require_text(backup_id, "Catalog backup ID")
+    _reconcile_catalog_backup_availability(db_path)
+    now = utc_now_iso()
+    restore_failure: Optional[str] = None
+    restored: Optional[Dict[str, Any]] = None
+    with session(db_path, immediate=True) as conn:
+        cursor = conn.cursor()
+        metadata_row = cursor.execute(
+            "SELECT * FROM catalog_backups WHERE backup_id=?", (backup_id,)
+        ).fetchone()
+        if not metadata_row:
+            raise ValueError("Catalog backup was not found")
+        metadata = dict(metadata_row)
+        if metadata["availability_status"] != CATALOG_BACKUP_AVAILABLE:
+            raise ValueError("Catalog backup is unavailable; restore was aborted")
+        manifest, unavailable = _validate_catalog_backup_record(
+            metadata,
+            db_path=resolve_db_path(db_path),
+        )
+        if unavailable:
+            status, reason = unavailable
+            # Do not raise while this transaction is open: committing the
+            # lifecycle change is what prevents a vanished file from being
+            # rediscovered as an active recovery point forever.
+            _mark_catalog_backup_unavailable_tx(
+                cursor,
+                metadata,
+                status=status,
+                reason=reason,
+                now=now,
+            )
+            restore_failure = "Catalog backup validation failed; restore was aborted"
+        else:
+            assert manifest is not None
+            # The current catalog is itself protected before it is replaced.
+            # This makes restore reversible and follows the same retention policy.
+            _backup_current_catalog_tx(cursor, db_path=db_path, actor=actor, now=now)
+            products = _prepare_catalog_products(manifest["products"], allow_legacy_prices=True)
+            restored = _replace_catalog_rows_tx(
+                cursor,
+                products,
+                source_name=f"catalog-backup:{backup_id}",
+                actor=actor,
+                now=now,
+                operation="restore",
+                source_backup_id=backup_id,
+            )
+    if restore_failure:
+        raise ValueError(restore_failure)
+    assert restored is not None
+    return restored
 
 
 def current_catalog_version(db_path: Optional[DatabasePath] = None) -> Optional[Dict[str, Any]]:
@@ -918,14 +1879,164 @@ def _normalized_confidence(value: Any) -> float:
     return confidence if 0.0 <= confidence <= 1.0 else 0.0
 
 
-def save_processed_order(
-    original_text: str,
-    items_data: List[Dict[str, Any]],
-    unresolved_text: List[str],
-    processing_time_ms: float,
+class ProcessRequestConflict(ValueError):
+    """A process idempotency key was reused for a different logical request."""
+
+
+class ProcessRequestInProgress(RuntimeError):
+    """The durable owner of an idempotent process request is still running."""
+
+
+def _process_payload_sha256(message: str) -> str:
+    """Hash the canonical process command without duplicating raw PII in a side table."""
+    payload = _canonical_action_payload({"message": message})
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _lease_expired(value: Any, now: datetime) -> bool:
+    try:
+        expires = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return True
+    if expires.tzinfo is None:
+        return True
+    return expires <= now
+
+
+def begin_process_request(
+    action_id: str,
+    *,
+    actor: str,
+    message: str,
     db_path: Optional[DatabasePath] = None,
-) -> int:
-    """Persist model recommendations only; human or approved state is rejected."""
+) -> Dict[str, Any]:
+    """Durably claim one logical process command before provider work begins.
+
+    The reservation is intentionally separate from ``human_actions``: a process
+    command has no order ID until the model result has been validated and saved.
+    It follows the same fail-closed contract, binding one action ID to one actor
+    and one canonical payload for the lifetime of the completed order.
+    """
+    action_id = str(action_id or "").strip()
+    actor = str(actor or "").strip()
+    if not action_id:
+        raise ValueError("Action ID is required")
+    if not actor:
+        raise ValueError("Process actor is required")
+    payload_sha256 = _process_payload_sha256(message)
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.isoformat()
+    lease_expires_at = (now_dt + timedelta(seconds=PROCESS_REQUEST_LEASE_SECONDS)).isoformat()
+    claim_token = secrets.token_urlsafe(24)
+
+    with session(db_path, immediate=True) as conn:
+        cursor = conn.cursor()
+        existing = cursor.execute(
+            "SELECT * FROM process_requests WHERE action_id=?", (action_id,)
+        ).fetchone()
+        if not existing:
+            cursor.execute(
+                """
+                INSERT INTO process_requests (
+                    action_id, actor, payload_sha256, state, claim_token,
+                    lease_expires_at, attempt_count, created_at, updated_at
+                ) VALUES (?, ?, ?, 'processing', ?, ?, 1, ?, ?)
+                """,
+                (action_id, actor, payload_sha256, claim_token, lease_expires_at, now, now),
+            )
+            return {
+                "outcome": "claimed",
+                "action_id": action_id,
+                "claim_token": claim_token,
+                "payload_sha256": payload_sha256,
+                "attempt_count": 1,
+            }
+
+        row = dict(existing)
+        if row["actor"] != actor or row["payload_sha256"] != payload_sha256:
+            raise ProcessRequestConflict(
+                f"Action ID '{action_id}' was already used for another command"
+            )
+        if row["state"] == "succeeded":
+            if row.get("order_id") is None:
+                raise ValueError("Completed process request has no order")
+            return {"outcome": "succeeded", "order_id": int(row["order_id"])}
+
+        reclaim = row["state"] == "failed" or _lease_expired(row.get("lease_expires_at"), now_dt)
+        if reclaim:
+            attempts = int(row.get("attempt_count") or 0) + 1
+            cursor.execute(
+                """
+                UPDATE process_requests
+                SET state='processing', claim_token=?, lease_expires_at=?,
+                    attempt_count=?, failure_code=NULL, updated_at=?
+                WHERE action_id=?
+                """,
+                (claim_token, lease_expires_at, attempts, now, action_id),
+            )
+            return {
+                "outcome": "claimed",
+                "action_id": action_id,
+                "claim_token": claim_token,
+                "payload_sha256": payload_sha256,
+                "attempt_count": attempts,
+            }
+        return {
+            "outcome": "in_progress",
+            "action_id": action_id,
+            "lease_expires_at": row.get("lease_expires_at"),
+        }
+
+
+def get_process_request(
+    action_id: str,
+    *,
+    actor: str,
+    message: str,
+    db_path: Optional[DatabasePath] = None,
+) -> Optional[Dict[str, Any]]:
+    """Read a process request only when its full idempotency binding matches."""
+    payload_sha256 = _process_payload_sha256(message)
+    with session(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM process_requests WHERE action_id=?", (action_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    if result["actor"] != actor or result["payload_sha256"] != payload_sha256:
+        raise ProcessRequestConflict(
+            f"Action ID '{action_id}' was already used for another command"
+        )
+    return result
+
+
+def fail_process_request(
+    action_id: str,
+    *,
+    actor: str,
+    message: str,
+    claim_token: str,
+    failure_code: str,
+    db_path: Optional[DatabasePath] = None,
+) -> None:
+    """Release only the current owner's failed attempt for an exact-key retry."""
+    payload_sha256 = _process_payload_sha256(message)
+    now = utc_now_iso()
+    with session(db_path, immediate=True) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE process_requests
+            SET state='failed', lease_expires_at=NULL, failure_code=?, updated_at=?
+            WHERE action_id=? AND actor=? AND payload_sha256=?
+              AND state='processing' AND claim_token=?
+            """,
+            (failure_code, now, action_id, actor, payload_sha256, claim_token),
+        )
+
+
+def _validate_model_ingestion(items_data: List[Dict[str, Any]]) -> None:
     forbidden_human_keys = {
         "human_decision",
         "human_selected_sku",
@@ -943,90 +2054,201 @@ def save_processed_order(
         if any(item.get(key) is not None for key in forbidden_human_keys):
             raise ValueError("Model ingestion cannot persist human approval provenance")
 
+
+def _save_processed_order_tx(
+    cursor: sqlite3.Cursor,
+    *,
+    original_text: str,
+    items_data: List[Dict[str, Any]],
+    unresolved_text: List[str],
+    processing_time_ms: float,
+) -> int:
+    """Persist only model recommendations using an existing write transaction."""
+    _validate_model_ingestion(items_data)
     now = utc_now_iso()
-    with session(db_path) as conn:
-        cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO orders (original_text, status, processing_time_ms, created_at, updated_at)
+        VALUES (?, 'needs_review', ?, ?, ?)
+        """,
+        (original_text, processing_time_ms, now, now),
+    )
+    order_id = int(cursor.lastrowid)
+    for item in items_data:
+        recommendation = item.get("recommendation_product") or {}
+        confidence = _normalized_confidence(item.get("confidence"))
+        requested_unit = str(item.get("extracted_unit") or "").strip()
+        recommendation_unit = str(recommendation.get("unit") or "").strip()
+        unit_check_status = (
+            classify_unit_check(requested_unit, recommendation_unit)
+            if recommendation.get("product_id")
+            else UNIT_CHECK_PENDING
+        )
         cursor.execute(
             """
-            INSERT INTO orders (original_text, status, processing_time_ms, created_at, updated_at)
-            VALUES (?, 'needs_review', ?, ?, ?)
+            INSERT INTO order_items (
+                order_id, raw_text, extracted_product, extracted_quantity, extracted_unit,
+                requested_unit, unit_check_status,
+                recommendation_product_id, recommendation_product_name, recommendation_unit,
+                recommendation_price, recommendation_decision, confidence, status,
+                candidates_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (original_text, processing_time_ms, now, now),
-        )
-        order_id = int(cursor.lastrowid)
-        for item in items_data:
-            recommendation = item.get("recommendation_product") or {}
-            confidence = _normalized_confidence(item.get("confidence"))
-            cursor.execute(
-                """
-                INSERT INTO order_items (
-                    order_id, raw_text, extracted_product, extracted_quantity, extracted_unit,
-                    recommendation_product_id, recommendation_product_name, recommendation_unit,
-                    recommendation_price, recommendation_decision, confidence, status,
-                    candidates_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    order_id,
-                    item.get("raw_text", ""),
-                    item.get("extracted_product", ""),
-                    item.get("extracted_quantity", 1.0),
-                    item.get("extracted_unit", "unit"),
-                    recommendation.get("product_id"),
-                    recommendation.get("product_name"),
-                    recommendation.get("unit"),
-                    recommendation.get("price"),
-                    item.get("recommendation_decision") or "INVALID_OUTPUT",
-                    confidence,
-                    item.get("status", "needs_review"),
-                    json.dumps(item.get("candidates", []), ensure_ascii=False),
-                    now,
-                    now,
-                ),
-            )
-            item_id = int(cursor.lastrowid)
-            log_audit_event_tx(
-                cursor,
+            (
                 order_id,
-                "model_recommendation_recorded",
-                json.dumps(
-                    {
-                        "item_id": item_id,
-                        "decision": item.get("recommendation_decision") or "INVALID_OUTPUT",
-                        "recommended_product_id": recommendation.get("product_id"),
-                        "model_confidence": confidence,
-                        "requires_human_confirmation": True,
-                    },
-                    ensure_ascii=False,
+                item.get("raw_text", ""),
+                item.get("extracted_product", ""),
+                item.get("extracted_quantity", 1.0),
+                requested_unit,
+                requested_unit,
+                unit_check_status,
+                recommendation.get("product_id"),
+                recommendation.get("product_name"),
+                recommendation_unit or None,
+                (
+                    to_storage(parse_money(recommendation.get("price"), "Recommendation price"))
+                    if recommendation.get("price") is not None
+                    else None
                 ),
+                item.get("recommendation_decision") or "INVALID_OUTPUT",
+                confidence,
+                item.get("status", "needs_review"),
+                json.dumps(item.get("candidates", []), ensure_ascii=False),
                 now,
-            )
+                now,
+            ),
+        )
+        item_id = int(cursor.lastrowid)
         log_audit_event_tx(
             cursor,
             order_id,
-            "analysis_completed",
+            "model_recommendation_recorded",
             json.dumps(
                 {
-                    "total_items": len(items_data),
-                    "status": "needs_review",
-                    "unresolved": unresolved_text,
+                    "item_id": item_id,
+                    "decision": item.get("recommendation_decision") or "INVALID_OUTPUT",
+                    "recommended_product_id": recommendation.get("product_id"),
+                    "model_confidence": confidence,
+                    "requires_human_confirmation": True,
                 },
                 ensure_ascii=False,
             ),
             now,
         )
-        conn.commit()
+    log_audit_event_tx(
+        cursor,
+        order_id,
+        "analysis_completed",
+        json.dumps(
+            {
+                "total_items": len(items_data),
+                "status": "needs_review",
+                "unresolved": unresolved_text,
+            },
+            ensure_ascii=False,
+        ),
+        now,
+    )
+    return order_id
+
+
+def save_processed_order(
+    original_text: str,
+    items_data: List[Dict[str, Any]],
+    unresolved_text: List[str],
+    processing_time_ms: float,
+    db_path: Optional[DatabasePath] = None,
+) -> int:
+    """Persist model recommendations only; human or approved state is rejected."""
+    with session(db_path) as conn:
+        return _save_processed_order_tx(
+            conn.cursor(),
+            original_text=original_text,
+            items_data=items_data,
+            unresolved_text=unresolved_text,
+            processing_time_ms=processing_time_ms,
+        )
+
+
+def complete_process_request(
+    action_id: str,
+    *,
+    actor: str,
+    message: str,
+    claim_token: str,
+    items_data: List[Dict[str, Any]],
+    unresolved_text: List[str],
+    processing_time_ms: float,
+    db_path: Optional[DatabasePath] = None,
+) -> int:
+    """Atomically persist a process result and its durable idempotency mapping."""
+    payload_sha256 = _process_payload_sha256(message)
+    now = utc_now_iso()
+    with session(db_path, immediate=True) as conn:
+        cursor = conn.cursor()
+        row = cursor.execute(
+            "SELECT * FROM process_requests WHERE action_id=?", (action_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError("Process request reservation is missing")
+        request_row = dict(row)
+        if request_row["actor"] != actor or request_row["payload_sha256"] != payload_sha256:
+            raise ProcessRequestConflict(
+                f"Action ID '{action_id}' was already used for another command"
+            )
+        if request_row["state"] == "succeeded":
+            if request_row.get("order_id") is None:
+                raise ValueError("Completed process request has no order")
+            return int(request_row["order_id"])
+        if request_row["state"] != "processing" or request_row.get("claim_token") != claim_token:
+            raise ProcessRequestInProgress("The original process request is still running")
+
+        order_id = _save_processed_order_tx(
+            cursor,
+            original_text=message,
+            items_data=items_data,
+            unresolved_text=unresolved_text,
+            processing_time_ms=processing_time_ms,
+        )
+        cursor.execute(
+            """
+            UPDATE process_requests
+            SET state='succeeded', order_id=?, claim_token=NULL, lease_expires_at=NULL,
+                failure_code=NULL, updated_at=?, completed_at=?
+            WHERE action_id=?
+            """,
+            (order_id, now, now, action_id),
+        )
+        log_audit_event_tx(
+            cursor,
+            order_id,
+            "process_request_completed",
+            json.dumps(
+                {
+                    "request_payload_sha256": payload_sha256,
+                    "attempt_count": request_row["attempt_count"],
+                    "requires_human_confirmation": True,
+                },
+                ensure_ascii=False,
+            ),
+            now,
+            actor=actor,
+            action_id=action_id,
+        )
         return order_id
 
 
-def _snapshot_subtotal(snapshot: List[Dict[str, Any]]) -> float:
+def _snapshot_subtotal(snapshot: List[Dict[str, Any]]) -> str:
     """Calculate a money subtotal from the frozen effective unit prices."""
-    total = 0.0
+    totals = []
     for item in snapshot:
-        price = _finite_number(item.get("price"), "Snapshot price", minimum=0.0)
-        quantity = _finite_number(item.get("quantity"), "Snapshot quantity", minimum=0.0)
-        total += round(price * quantity, 2)
-    return round(total, 2)
+        frozen_total = item.get("line_total")
+        totals.append(
+            from_storage(frozen_total, "Snapshot line total")
+            if frozen_total not in (None, "")
+            else line_total(item.get("price"), item.get("quantity"))
+        )
+    return to_storage(money_sum(totals))
 
 
 def _frozen_order_financials(
@@ -1054,7 +2276,7 @@ def _frozen_order_financials(
         "customer_phone": order["customer_phone"] or "",
         "customer_address": order["customer_address"] or "",
         "subtotal": subtotal,
-        "discount": 0.0,
+        "discount": "0.00",
         "grand_total": subtotal,
         "approved_at": order["approved_at"],
     }
@@ -1178,7 +2400,38 @@ def _finite_number(
 
 
 def _canonical_action_payload(payload: Dict[str, Any]) -> str:
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    def normalise(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return to_storage(value)
+        if isinstance(value, dict):
+            return {str(key): normalise(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [normalise(item) for item in value]
+        return value
+
+    return json.dumps(normalise(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _money_payload_matches(
+    payload_json: Any,
+    field: str,
+    expected: Decimal,
+    *,
+    allow_legacy: bool = False,
+) -> bool:
+    """Compare action evidence without changing its historical monetary value.
+
+    New human mutations must satisfy the two-decimal input policy.  Frozen
+    snapshots from before that policy can contain an auditable higher-scale
+    amount, however, so export verification opts into the read-only legacy
+    parser explicitly rather than making current commercial writes permissive.
+    """
+    try:
+        payload = json.loads(str(payload_json))
+        parser = from_storage if allow_legacy else parse_money
+        return isinstance(payload, dict) and parser(payload.get(field), field) == expected
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def _existing_action(
@@ -1252,13 +2505,9 @@ def _insert_action(
     return True
 
 
-def _money_amount(value: Any, name: str, *, minimum: float = 0.0) -> float:
-    """Validate an operator-entered money amount to exactly cents precision."""
-    amount = _finite_number(value, name, minimum=minimum)
-    rounded = round(amount, 2)
-    if abs(amount - rounded) > 1e-9:
-        raise ValueError(f"{name} must have at most two decimal places")
-    return rounded
+def _money_amount(value: Any, name: str):
+    """Validate monetary input without binary float arithmetic or silent rounding."""
+    return parse_money(value, name)
 
 
 def _refresh_order_review_status(
@@ -1267,11 +2516,20 @@ def _refresh_order_review_status(
     now: str,
 ) -> None:
     """Mark an order ready only once every non-deleted line has a final state."""
-    statuses = [
-        row["status"]
-        for row in cursor.execute("SELECT status FROM order_items WHERE order_id=?", (order_id,))
+    rows = [
+        dict(row)
+        for row in cursor.execute(
+            "SELECT status, human_decision, unit_check_status FROM order_items WHERE order_id=?",
+            (order_id,),
+        )
     ]
-    order_status = "analyzed" if statuses and all(s in FINAL_ITEM_STATUSES for s in statuses) else "needs_review"
+    all_final = rows and all(row["status"] in FINAL_ITEM_STATUSES for row in rows)
+    unit_ready = all(
+        row.get("human_decision") != "SELECT"
+        or unit_check_is_approval_ready(row.get("unit_check_status"))
+        for row in rows
+    )
+    order_status = "analyzed" if all_final and unit_ready else "needs_review"
     cursor.execute(
         "UPDATE orders SET status=?, updated_at=? WHERE id=?",
         (order_status, now, order_id),
@@ -1374,11 +2632,11 @@ def add_manual_order_item(
     action_id = _require_text(action_id, "Action ID")
     selected_sku = _require_text(selected_sku, "Selected SKU")
     final_quantity = _finite_number(quantity, "Quantity", minimum=0.000000001)
-    final_unit = _require_text(unit, "Unit")
+    submitted_unit = _require_text(unit, "Unit")
     payload = {
         "selected_sku": selected_sku,
         "quantity": final_quantity,
-        "unit": final_unit,
+        "unit": submitted_unit,
     }
     now = utc_now_iso()
     with session(db_path, immediate=True) as conn:
@@ -1410,17 +2668,23 @@ def add_manual_order_item(
         product = catalog_lookup.get(selected_sku)
         if not product:
             raise ValueError(f"Invalid product code: {selected_sku}")
-        catalog_price = _finite_number(product.price, "Catalog price", minimum=0.0)
+        if not units_equivalent(submitted_unit, product.unit):
+            raise ValueError(
+                "Manual-line unit must match the selected catalog unit; unit conversions are not supported"
+            )
+        final_unit = _require_text(product.unit, "Catalog unit")
+        catalog_price = parse_money(product.price, "Catalog price")
         cursor.execute(
             """
             INSERT INTO order_items (
                 order_id, raw_text, extracted_product, extracted_quantity, extracted_unit,
+                requested_unit, final_quantity, final_unit, unit_check_status,
                 matched_product_id, matched_product_name, matched_unit, matched_price,
                 recommendation_decision, confidence, status, is_manually_corrected,
                 is_human_confirmed, human_decision, human_selected_sku, human_actor,
                 human_confirmed_at, review_action_id, catalog_price, candidates_json,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', 0.0, 'human_selected', 0,
+            ) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'MANUAL', 0.0, 'human_selected', 0,
                       1, 'SELECT', ?, ?, ?, ?, ?, '[]', ?, ?)
             """,
             (
@@ -1429,15 +2693,18 @@ def add_manual_order_item(
                 product.product_name,
                 final_quantity,
                 final_unit,
+                final_quantity,
+                final_unit,
+                UNIT_CHECK_MANUAL_CATALOG,
                 selected_sku,
                 product.product_name,
                 product.unit,
-                catalog_price,
+                to_storage(catalog_price),
                 selected_sku,
                 actor,
                 now,
                 action_id,
-                catalog_price,
+                to_storage(catalog_price),
                 now,
                 now,
             ),
@@ -1463,7 +2730,9 @@ def add_manual_order_item(
                     "selected_sku": selected_sku,
                     "quantity": final_quantity,
                     "unit": final_unit,
-                    "catalog_price": catalog_price,
+                    "catalog_unit": final_unit,
+                    "unit_check_status": UNIT_CHECK_MANUAL_CATALOG,
+                    "catalog_price": to_storage(catalog_price),
                     "requires_human_confirmation": False,
                     "human_decision": "SELECT",
                 },
@@ -1573,7 +2842,7 @@ def override_order_item_price(
     actor = _require_text(actor, "Human actor")
     action_id = _require_text(action_id, "Action ID")
     override = _money_amount(price, "Price")
-    payload = {"price": override}
+    payload = {"price": to_storage(override)}
     now = utc_now_iso()
     with session(db_path, immediate=True) as conn:
         cursor = conn.cursor()
@@ -1609,7 +2878,7 @@ def override_order_item_price(
         catalog_price = item["catalog_price"]
         if catalog_price is None:
             catalog_price = item["matched_price"]
-        catalog_price = _finite_number(catalog_price, "Catalog price", minimum=0.0)
+        catalog_price = parse_money(catalog_price, "Catalog price")
         _insert_action(
             cursor,
             action_id=action_id,
@@ -1628,7 +2897,15 @@ def override_order_item_price(
                 price_override_action_id=?, updated_at=?
             WHERE id=?
             """,
-            (catalog_price, override, actor, now, action_id, now, item_id),
+            (
+                to_storage(catalog_price),
+                to_storage(override),
+                actor,
+                now,
+                action_id,
+                now,
+                item_id,
+            ),
         )
         log_audit_event_tx(
             cursor,
@@ -1638,8 +2915,8 @@ def override_order_item_price(
                 {
                     "item_id": item_id,
                     "product_id": item["matched_product_id"],
-                    "catalog_price": catalog_price,
-                    "price_override": override,
+                    "catalog_price": to_storage(catalog_price),
+                    "price_override": to_storage(override),
                 },
                 ensure_ascii=False,
             ),
@@ -1663,7 +2940,7 @@ def update_order_discount(
     actor = _require_text(actor, "Human actor")
     action_id = _require_text(action_id, "Action ID")
     amount = _money_amount(discount, "Discount")
-    payload = {"discount": amount}
+    payload = {"discount": to_storage(amount)}
     now = utc_now_iso()
     with session(db_path, immediate=True) as conn:
         cursor = conn.cursor()
@@ -1694,7 +2971,10 @@ def update_order_discount(
             payload=payload,
             timestamp=now,
         )
-        cursor.execute("UPDATE orders SET discount=?, updated_at=? WHERE id=?", (amount, now, order_id))
+        cursor.execute(
+            "UPDATE orders SET discount=?, updated_at=? WHERE id=?",
+            (to_storage(amount), now, order_id),
+        )
         log_audit_event_tx(
             cursor,
             order_id,
@@ -1719,28 +2999,52 @@ def review_order_item(
     selected_sku: Optional[str] = None,
     quantity: Optional[float] = None,
     unit: Optional[str] = None,
+    unit_resolution: Optional[str] = None,
+    unit_resolution_note: Optional[str] = None,
     db_path: Optional[DatabasePath] = None,
 ) -> Dict[str, Any]:
-    """Apply one explicit, attributable, idempotent human review command."""
+    """Apply one attributable review without ever inferring a unit conversion.
+
+    ``extracted_*`` remains the customer request.  A selected catalog line gets
+    its own ``final_*`` commercial fields, so "3 cartons" can never be silently
+    rewritten as "3 pieces" merely because the selected SKU is priced per piece.
+    """
     actor = _require_text(actor, "Human actor")
     action_id = _require_text(action_id, "Action ID")
     decision = _require_text(final_decision, "Final decision").upper()
     if decision not in {"SELECT", "NOT_FOUND"}:
         raise ValueError("Final decision must be SELECT or NOT_FOUND")
+
+    resolution = str(unit_resolution or "").strip().upper() or None
+    note = str(unit_resolution_note or "").strip()
+    if len(note) > 500:
+        raise ValueError("Unit-resolution note must be at most 500 characters")
+    if resolution not in {None, "HUMAN_OVERRIDE"}:
+        raise ValueError("Unit resolution must be HUMAN_OVERRIDE when supplied")
+
     if decision == "SELECT":
         selected_sku = _require_text(selected_sku, "Selected SKU")
         if quantity is None:
             raise ValueError("Quantity must be a positive number")
         quantity = _finite_number(quantity, "Quantity", minimum=0.000000001)
-        unit = _require_text(unit, "Unit")
-    elif selected_sku:
-        raise ValueError("NOT_FOUND must not include a selected SKU")
+        unit = _require_text(unit, "Final commercial unit")
+        if note and resolution is None:
+            raise ValueError("Unit-resolution note requires HUMAN_OVERRIDE")
+    else:
+        if selected_sku:
+            raise ValueError("NOT_FOUND must not include a selected SKU")
+        if resolution or note:
+            raise ValueError("NOT_FOUND must not include a unit-resolution override")
 
+    # This exact request payload is immutable human evidence.  The audit event
+    # additionally records the requested/catalog/final units seen at review.
     payload = {
         "final_decision": decision,
         "selected_sku": selected_sku,
         "quantity": float(quantity) if quantity is not None else None,
         "unit": unit,
+        "unit_resolution": resolution,
+        "unit_resolution_note": note or None,
     }
     now = utc_now_iso()
     with session(db_path, immediate=True) as conn:
@@ -1780,7 +3084,10 @@ def review_order_item(
                 """
                 UPDATE order_items
                 SET matched_product_id=NULL, matched_product_name=NULL, matched_unit=NULL,
-                    matched_price=NULL, status='not_found_confirmed',
+                    matched_price=NULL, final_quantity=NULL, final_unit=NULL,
+                    unit_resolution=NULL, unit_resolution_note=NULL,
+                    unit_resolution_actor=NULL, unit_resolved_at=NULL,
+                    unit_resolution_action_id=NULL, status='not_found_confirmed',
                     is_human_confirmed=1, human_decision='NOT_FOUND',
                     human_selected_sku=NULL, human_actor=?, human_confirmed_at=?,
                     review_action_id=?, catalog_price=NULL, price_override=NULL,
@@ -1810,21 +3117,38 @@ def review_order_item(
             product = catalog_lookup.get(selected_sku)
             if not product:
                 raise ValueError(f"Invalid product code: {selected_sku}")
-            catalog_price = _finite_number(product.price, "Catalog price", minimum=0.0)
+            if not units_equivalent(unit, product.unit):
+                raise ValueError(
+                    "Final commercial unit must match the selected catalog unit; unit conversions are not supported"
+                )
+
+            requested_unit = item.get("requested_unit")
+            check = classify_unit_check(requested_unit, product.unit)
+            if unit_check_requires_resolution(check):
+                if resolution != "HUMAN_OVERRIDE" or not note:
+                    raise ValueError(
+                        "Customer and catalog units differ or one is missing. "
+                        "Enter the final quantity in the catalog unit and record a HUMAN_OVERRIDE note; "
+                        "the system does not convert units."
+                    )
+                resolved_status = UNIT_CHECK_HUMAN_OVERRIDE
+            else:
+                if resolution or note:
+                    raise ValueError("HUMAN_OVERRIDE is allowed only when the unit differs or is missing")
+                resolved_status = UNIT_CHECK_EQUIVALENT
+
+            catalog_price = parse_money(product.price, "Catalog price")
             final_quantity = float(quantity)
-            final_unit = str(unit)
-            # A "correction" means the human overrode what the MODEL proposed.
-            # The baseline is therefore the model recommendation, never
-            # matched_product_id (which is NULL until this very review runs and
-            # would otherwise record a spurious None -> SKU correction on every
-            # accepted recommendation, poisoning the learning signal).
+            final_unit = _require_text(product.unit, "Catalog unit")
+            # A correction means the human overrode the advisory model output,
+            # not merely the provisional matcher state.
             model_sku = item.get("recommendation_product_id")
             model_quantity = float(item.get("extracted_quantity") or 0.0)
-            model_unit = item.get("extracted_unit")
+            model_unit = item.get("requested_unit") or item.get("extracted_unit")
 
             product_changed = model_sku != selected_sku
             quantity_changed = abs(model_quantity - final_quantity) > 0.001
-            unit_changed = (model_unit or "") != final_unit
+            unit_changed = not units_equivalent(model_unit, final_unit)
             changed = product_changed or quantity_changed or unit_changed
 
             corrections = []
@@ -1855,7 +3179,9 @@ def review_order_item(
                 """
                 UPDATE order_items
                 SET matched_product_id=?, matched_product_name=?, matched_unit=?,
-                    matched_price=?, extracted_quantity=?, extracted_unit=?,
+                    matched_price=?, final_quantity=?, final_unit=?,
+                    unit_check_status=?, unit_resolution=?, unit_resolution_note=?,
+                    unit_resolution_actor=?, unit_resolved_at=?, unit_resolution_action_id=?,
                     status='human_selected', is_manually_corrected=?,
                     is_human_confirmed=1, human_decision='SELECT',
                     human_selected_sku=?, human_actor=?, human_confirmed_at=?,
@@ -1867,16 +3193,22 @@ def review_order_item(
                 (
                     selected_sku,
                     product.product_name,
-                    product.unit,
-                    catalog_price,
+                    final_unit,
+                    to_storage(catalog_price),
                     final_quantity,
                     final_unit,
+                    resolved_status,
+                    resolution,
+                    note or None,
+                    actor if resolution else None,
+                    now if resolution else None,
+                    action_id if resolution else None,
                     1 if changed else 0,
                     selected_sku,
                     actor,
                     now,
                     action_id,
-                    catalog_price,
+                    to_storage(catalog_price),
                     now,
                     item_id,
                 ),
@@ -1886,6 +3218,13 @@ def review_order_item(
                 "model_recommendation": item.get("recommendation_product_id"),
                 "human_selected_final_sku": selected_sku,
                 "model_confidence": item.get("confidence"),
+                "requested_unit": requested_unit or "",
+                "catalog_unit": final_unit,
+                "final_quantity": final_quantity,
+                "final_unit": final_unit,
+                "unit_check_status": resolved_status,
+                "unit_resolution": resolution,
+                "unit_resolution_note": note or None,
             }
             log_audit_event_tx(
                 cursor,
@@ -1896,6 +3235,16 @@ def review_order_item(
                 actor=actor,
                 action_id=action_id,
             )
+            if resolution == "HUMAN_OVERRIDE":
+                log_audit_event_tx(
+                    cursor,
+                    order_id,
+                    "unit_mismatch_resolved",
+                    json.dumps(audit_payload, ensure_ascii=False),
+                    now,
+                    actor=actor,
+                    action_id=action_id,
+                )
             log_audit_event_tx(
                 cursor,
                 order_id,
@@ -1940,6 +3289,8 @@ def update_order_item(
         selected_sku=updates.get("selected_sku") or updates.get("product_id"),
         quantity=updates.get("quantity"),
         unit=updates.get("unit"),
+        unit_resolution=updates.get("unit_resolution"),
+        unit_resolution_note=updates.get("unit_resolution_note"),
         catalog_lookup=catalog_lookup,
         db_path=db_path,
     )
@@ -1995,7 +3346,7 @@ def _verified_price_override(
     if override is None or not action_id or not actor or not timestamp:
         return False
     try:
-        expected_payload = _canonical_action_payload({"price": _money_amount(override, "Price")})
+        expected = _money_amount(override, "Price")
     except ValueError:
         return False
     action = cursor.execute(
@@ -2016,7 +3367,7 @@ def _verified_price_override(
     return bool(
         action
         and action["timestamp"] == timestamp
-        and action["payload_json"] == expected_payload
+        and _money_payload_matches(action["payload_json"], "price", expected)
         and event
     )
 
@@ -2063,20 +3414,79 @@ def _verified_final_line_decision(
             item.get("status") != "human_selected"
             or not item.get("matched_product_id")
             or item.get("human_selected_sku") != item.get("matched_product_id")
+            or item.get("final_quantity") is None
+            or not item.get("final_unit")
+            or not item.get("matched_unit")
+            or not units_equivalent(item.get("final_unit"), item.get("matched_unit"))
+            or not unit_check_is_approval_ready(item.get("unit_check_status"))
+        ):
+            return False
+        try:
+            action_payload = json.loads(action["payload_json"])
+            action_quantity = _finite_number(
+                action_payload.get("quantity"), "Reviewed quantity", minimum=0.000000001
+            )
+            final_quantity = _finite_number(
+                item.get("final_quantity"), "Final quantity", minimum=0.000000001
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
+            return False
+        if action_type != "manual_item_added" and (
+            not isinstance(action_payload, dict)
+            or action_payload.get("final_decision") != "SELECT"
+            or action_payload.get("selected_sku") != item.get("matched_product_id")
+            or abs(action_quantity - final_quantity) > 0.000000001
+            or not units_equivalent(action_payload.get("unit"), item.get("final_unit"))
         ):
             return False
         if action_type == "manual_item_added":
-            expected_payload = _canonical_action_payload(
-                {
-                    "selected_sku": item.get("matched_product_id"),
-                    "quantity": _finite_number(
-                        item.get("extracted_quantity"), "Manual quantity", minimum=0.000000001
-                    ),
-                    "unit": _require_text(item.get("extracted_unit"), "Manual unit"),
-                }
-            )
-            if action["payload_json"] != expected_payload:
+            # A manual add may use an obvious alias (pcs/piece, قطعة/قطع),
+            # while the final document intentionally keeps the catalog spelling.
+            try:
+                manual_payload = json.loads(action["payload_json"])
+                manual_quantity = _finite_number(
+                    manual_payload.get("quantity"), "Manual quantity", minimum=0.000000001
+                )
+            except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
                 return False
+            if (
+                not isinstance(manual_payload, dict)
+                or manual_payload.get("selected_sku") != item.get("matched_product_id")
+                or abs(manual_quantity - final_quantity) > 0.000000001
+                or not units_equivalent(manual_payload.get("unit"), item.get("final_unit"))
+            ):
+                return False
+        elif item.get("unit_check_status") == UNIT_CHECK_HUMAN_OVERRIDE:
+            if (
+                action_payload.get("unit_resolution") != "HUMAN_OVERRIDE"
+                or action_payload.get("unit_resolution_note") != item.get("unit_resolution_note")
+                or item.get("unit_resolution") != "HUMAN_OVERRIDE"
+                or not item.get("unit_resolution_note")
+                or item.get("unit_resolution_actor") != actor
+                or item.get("unit_resolved_at") != confirmed_at
+                or item.get("unit_resolution_action_id") != action_id
+            ):
+                return False
+            resolution_event = cursor.execute(
+                """
+                SELECT 1 FROM audit_events
+                WHERE order_id=? AND event_type='unit_mismatch_resolved'
+                  AND actor=? AND action_id=?
+                """,
+                (order_id, actor, action_id),
+            ).fetchone()
+            if not resolution_event:
+                return False
+        elif item.get("unit_check_status") == UNIT_CHECK_EQUIVALENT:
+            if (
+                action_payload.get("unit_resolution") is not None
+                or action_payload.get("unit_resolution_note") is not None
+                or item.get("unit_resolution") is not None
+                or item.get("unit_resolution_note") is not None
+            ):
+                return False
+        else:
+            return False
         return _verified_price_override(cursor, order_id, item)
     if decision == "NOT_FOUND":
         return item.get("status") == "not_found_confirmed" and item.get("matched_product_id") is None
@@ -2085,12 +3495,14 @@ def _verified_final_line_decision(
     return False
 
 
-def _effective_item_price(item: Dict[str, Any]) -> tuple[float, float, Optional[float], bool]:
+def _effective_item_price(item: Dict[str, Any]):
     """Return (effective, catalog, override, overridden) for a selected line."""
     catalog = item.get("catalog_price")
     if catalog is None:
         catalog = item.get("matched_price")
-    catalog_price = _finite_number(catalog, "Catalog price", minimum=0.0)
+    catalog_price = from_storage(catalog, "Catalog price")
+    if catalog_price < ZERO:
+        raise ValueError("Catalog price must not be negative")
     overridden = bool(item.get("price_overridden"))
     if not overridden:
         if item.get("price_override") is not None:
@@ -2166,9 +3578,15 @@ def approve_order(
         if not items:
             raise ValueError("Cannot approve order with no items")
         invalid = []
+        unresolved_unit_items = []
         selected = []
         for item in items:
             decision = item.get("human_decision")
+            if decision == "SELECT" and not unit_check_is_approval_ready(
+                item.get("unit_check_status")
+            ):
+                unresolved_unit_items.append(item.get("raw_text") or f"Item #{item['id']}")
+                continue
             if decision not in HUMAN_DECISIONS or not _verified_final_line_decision(
                 cursor, order_id, item
             ):
@@ -2176,6 +3594,12 @@ def approve_order(
                 continue
             if decision == "SELECT":
                 selected.append(item)
+        if unresolved_unit_items:
+            raise ValueError(
+                "Cannot approve order with unresolved unit mismatch: "
+                f"{', '.join(unresolved_unit_items)}. Record an explicit HUMAN_OVERRIDE "
+                "with the final quantity in the catalog unit, or exclude the line."
+            )
         if invalid:
             raise ValueError(
                 f"Cannot approve order with unresolved items: {', '.join(invalid)}. "
@@ -2210,7 +3634,7 @@ def approve_order(
                 raise ValueError("Duplicate approval action did not complete")
             return _approval_response(cursor, refreshed)
 
-        frozen_lines: list[tuple[Dict[str, Any], float, float, Optional[float], bool]] = []
+        frozen_lines: list[tuple[Dict[str, Any], Decimal, Decimal, Optional[Decimal], bool]] = []
         for item in selected:
             try:
                 effective_price, catalog_price, price_override, price_overridden = _effective_item_price(item)
@@ -2222,38 +3646,52 @@ def approve_order(
             raise ValueError(
                 f"Cannot approve order with invalid price evidence: {', '.join(invalid)}"
             )
-        subtotal = round(
-            sum(round(price * _finite_number(item.get("extracted_quantity"), "Quantity", minimum=0.0), 2)
-                for item, price, _catalog, _override, _overridden in frozen_lines),
-            2,
-        )
+        frozen_line_totals = [
+            line_total(price, _finite_number(item.get("final_quantity"), "Quantity", minimum=0.0))
+            for item, price, _catalog, _override, _overridden in frozen_lines
+        ]
+        subtotal = money_sum(frozen_line_totals)
         discount = _money_amount(order["discount"], "Discount")
-        if discount > subtotal + 1e-9:
+        if discount > subtotal:
             raise ValueError("Discount cannot exceed the approved order subtotal")
-        grand_total = round(subtotal - discount, 2)
+        grand_total = (subtotal - discount).quantize(Decimal("0.01"))
 
-        for item, effective_price, catalog_price, price_override, price_overridden in frozen_lines:
+        for (item, effective_price, catalog_price, price_override, price_overridden), frozen_line_total in zip(
+            frozen_lines, frozen_line_totals, strict=True
+        ):
             cursor.execute(
                 """
                 INSERT INTO approved_order_items (
                     order_id, original_item_id, product_id, product_name, quantity,
-                    unit, price, confidence, model_recommendation_id, model_decision,
+                    unit, requested_unit, catalog_unit, unit_check_status, unit_resolution,
+                    unit_resolution_note, unit_resolution_actor, unit_resolved_at,
+                    unit_resolution_action_id, price, line_total, confidence,
+                    model_recommendation_id, model_decision,
                     human_decision, human_selected_sku, human_actor, human_confirmed_at,
                     review_action_id, approval_actor, approval_action_id,
                     provenance_verified, is_manually_corrected, is_human_confirmed,
                     catalog_price, price_override, price_overridden,
                     price_override_actor, price_overridden_at, price_override_action_id,
                     approved_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SELECT', ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'SELECT', ?, ?, ?, ?, ?, ?, 1, ?, 1, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
                     item["id"],
                     item["matched_product_id"],
                     item["matched_product_name"],
-                    item["extracted_quantity"],
-                    item["extracted_unit"],
-                    effective_price,
+                    item["final_quantity"],
+                    item["final_unit"],
+                    item.get("requested_unit"),
+                    item.get("matched_unit"),
+                    item["unit_check_status"],
+                    item.get("unit_resolution"),
+                    item.get("unit_resolution_note"),
+                    item.get("unit_resolution_actor"),
+                    item.get("unit_resolved_at"),
+                    item.get("unit_resolution_action_id"),
+                    to_storage(effective_price),
+                    to_storage(frozen_line_total),
                     item["confidence"],
                     item.get("recommendation_product_id"),
                     item.get("recommendation_decision"),
@@ -2264,8 +3702,8 @@ def approve_order(
                     actor,
                     action_id,
                     item["is_manually_corrected"],
-                    catalog_price,
-                    price_override,
+                    to_storage(catalog_price),
+                    to_storage(price_override) if price_override is not None else None,
                     1 if price_overridden else 0,
                     item.get("price_override_actor"),
                     item.get("price_overridden_at"),
@@ -2289,9 +3727,9 @@ def approve_order(
                 order["customer_name"] or "",
                 order["customer_phone"] or "",
                 order["customer_address"] or "",
-                subtotal,
-                discount,
-                grand_total,
+                to_storage(subtotal),
+                to_storage(discount),
+                to_storage(grand_total),
                 now,
             ),
         )
@@ -2304,9 +3742,9 @@ def approve_order(
                     "approved_snapshot_item_ids": [item["id"] for item in selected],
                     "excluded_not_found_item_ids": payload["excluded_not_found_item_ids"],
                     "excluded_cancelled_item_ids": payload["excluded_cancelled_item_ids"],
-                    "subtotal": subtotal,
-                    "discount": discount,
-                    "grand_total": grand_total,
+                    "subtotal": to_storage(subtotal),
+                    "discount": to_storage(discount),
+                    "grand_total": to_storage(grand_total),
                 },
                 ensure_ascii=False,
             ),
@@ -2386,31 +3824,78 @@ def _verified_snapshot_item_provenance(
         or not approval_event
     ):
         return False
-    if action_type == "manual_item_added":
+    unit_status = item.get("unit_check_status") or UNIT_CHECK_LEGACY_APPROVED
+    if unit_status != UNIT_CHECK_LEGACY_APPROVED:
+        if (
+            not unit_check_is_approval_ready(unit_status)
+            or not item.get("catalog_unit")
+            or not units_equivalent(item.get("unit"), item.get("catalog_unit"))
+        ):
+            return False
         try:
-            expected = _canonical_action_payload(
-                {
-                    "selected_sku": item["product_id"],
-                    "quantity": _finite_number(item["quantity"], "Manual quantity", minimum=0.000000001),
-                    "unit": _require_text(item["unit"], "Manual unit"),
-                }
+            review_payload = json.loads(review_action["payload_json"])
+            reviewed_quantity = _finite_number(
+                review_payload.get("quantity"), "Reviewed quantity", minimum=0.000000001
             )
-        except ValueError:
+            snapshot_quantity = _finite_number(
+                item.get("quantity"), "Snapshot quantity", minimum=0.000000001
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
             return False
-        if review_action["payload_json"] != expected:
-            return False
-
+        if action_type == "item_review":
+            if (
+                not isinstance(review_payload, dict)
+                or review_payload.get("final_decision") != "SELECT"
+                or review_payload.get("selected_sku") != item.get("product_id")
+                or abs(reviewed_quantity - snapshot_quantity) > 0.000000001
+                or not units_equivalent(review_payload.get("unit"), item.get("unit"))
+            ):
+                return False
+        elif action_type == "manual_item_added":
+            if (
+                not isinstance(review_payload, dict)
+                or review_payload.get("selected_sku") != item.get("product_id")
+                or abs(reviewed_quantity - snapshot_quantity) > 0.000000001
+                or not units_equivalent(review_payload.get("unit"), item.get("unit"))
+            ):
+                return False
+        if unit_status == UNIT_CHECK_HUMAN_OVERRIDE:
+            if (
+                review_payload.get("unit_resolution") != "HUMAN_OVERRIDE"
+                or review_payload.get("unit_resolution_note") != item.get("unit_resolution_note")
+                or item.get("unit_resolution") != "HUMAN_OVERRIDE"
+                or not item.get("unit_resolution_note")
+                or item.get("unit_resolution_actor") != item.get("human_actor")
+                or item.get("unit_resolved_at") != item.get("human_confirmed_at")
+                or item.get("unit_resolution_action_id") != item.get("review_action_id")
+            ):
+                return False
+            resolution_event = cursor.execute(
+                """
+                SELECT 1 FROM audit_events
+                WHERE order_id=? AND event_type='unit_mismatch_resolved'
+                  AND actor=? AND action_id=?
+                """,
+                (order_id, item["human_actor"], item["review_action_id"]),
+            ).fetchone()
+            if not resolution_event:
+                return False
+        elif unit_status == UNIT_CHECK_EQUIVALENT:
+            if item.get("unit_resolution") or item.get("unit_resolution_note"):
+                return False
     overridden = bool(item.get("price_overridden"))
     catalog = item.get("catalog_price")
     if catalog is None:
         catalog = item.get("price")
     try:
-        catalog_price = _finite_number(catalog, "Snapshot catalog price", minimum=0.0)
-        effective = _finite_number(item.get("price"), "Snapshot price", minimum=0.0)
+        catalog_price = from_storage(catalog, "Snapshot catalog price")
+        effective = from_storage(item.get("price"), "Snapshot price")
     except ValueError:
         return False
+    if catalog_price < ZERO or effective < ZERO:
+        return False
     if not overridden:
-        return item.get("price_override") is None and abs(effective - catalog_price) < 1e-9
+        return item.get("price_override") is None and effective == catalog_price
 
     override = item.get("price_override")
     override_action_id = item.get("price_override_action_id")
@@ -2419,10 +3904,13 @@ def _verified_snapshot_item_provenance(
     if override is None or not override_action_id or not override_actor or not override_time:
         return False
     try:
-        amount = _money_amount(override, "Price")
+        # This is frozen, pre-existing commercial evidence.  It must remain
+        # exportable even if the old recorded value predates today's two-place
+        # input rule; mutable overrides are still validated by _money_amount.
+        amount = from_storage(override, "Price")
     except ValueError:
         return False
-    if abs(effective - amount) >= 1e-9:
+    if effective != amount:
         return False
     override_action = cursor.execute(
         """
@@ -2442,7 +3930,9 @@ def _verified_snapshot_item_provenance(
     return bool(
         override_action
         and override_action["timestamp"] == override_time
-        and override_action["payload_json"] == _canonical_action_payload({"price": amount})
+        and _money_payload_matches(
+            override_action["payload_json"], "price", amount, allow_legacy=True
+        )
         and override_event
     )
 

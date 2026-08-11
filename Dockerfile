@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY catalog.csv ./catalog.csv
 
-# The SQLite database lives here. Mount a volume at /app/data to persist it.
+# The SQLite database lives here. Mount the single Railway volume at /app/data
+# and set PERSISTENT_VOLUME_PATH=/app/data for production startup validation.
 RUN mkdir -p /app/data
 ENV ORDERS_DB_PATH=/app/data/orders.db
 
@@ -25,7 +26,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4).status==200 else 1)"
 
-# FORWARDED_ALLOW_IPS defaults to the loopback only. Set it to your platform's
-# proxy addresses (Railway/Fly terminate TLS in front of the app) and set
-# TRUST_PROXY_HEADERS=true so the login throttle keys on the real client IP.
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips=${FORWARDED_ALLOW_IPS:-127.0.0.1}"]
+# FORWARDED_ALLOW_IPS defaults to loopback for local use only. Railway
+# production must configure the documented explicit proxy CIDRs, and must run
+# exactly one Uvicorn worker against exactly one mounted SQLite volume.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port \"${PORT:-8000}\" --workers 1 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:-127.0.0.1}\""]

@@ -29,7 +29,7 @@ from app.xlsx_export import (
     TOTAL_VALUE_COLUMN,
     build_order_workbook,
 )
-from tests.helpers import login
+from tests.helpers import login, process_payload
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -56,9 +56,15 @@ UNRESOLVED_NOTE = "ابعتهم بسرعة الله يكرمك"
 class ScriptedExtractor:
     """Returns a fixed multi-line order plus the fragments it could not parse."""
 
-    def __init__(self, unresolved=(UNRESOLVED_NOTE,), product_name="لبن جهينة"):
+    def __init__(
+        self,
+        unresolved=(UNRESOLVED_NOTE,),
+        product_name="لبن جهينة",
+        first_unit="كرتونة",
+    ):
         self.unresolved = list(unresolved)
         self.product_name = product_name
+        self.first_unit = first_unit
 
     def extract(self, message: str) -> ExtractionResult:
         return ExtractionResult(
@@ -67,7 +73,7 @@ class ScriptedExtractor:
                     raw_text="2 لبن جهينة",
                     product_description=self.product_name,
                     quantity=2.0,
-                    unit="كرتونة",
+                    unit=self.first_unit,
                 ),
                 ExtractedItem(
                     raw_text="3 سكر",
@@ -107,7 +113,7 @@ def upload_catalog(client: TestClient, payload: bytes):
 
 
 def analyse(client: TestClient, message: str = ORDER_TEXT):
-    response = client.post("/api/process", json={"message": message})
+    response = client.post("/api/process", json=process_payload(message))
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -765,7 +771,15 @@ def assert_no_handler_survives_as_markup(html: str):
 def test_an_xss_payload_in_a_product_name_is_inert_in_the_document(shop, monkeypatch):
     client, _ = shop
     set_shop(client)
-    monkeypatch.setattr(main_module, "extractor", ScriptedExtractor(product_name=XSS_NAME))
+    # This test changes the selected product from the first line's normal
+    # carton catalog item to the XSS fixture, whose catalog unit is piece.
+    # Preserve a compatible requested unit so the test remains about HTML
+    # escaping rather than deliberately exercising the unit safety barrier.
+    monkeypatch.setattr(
+        main_module,
+        "extractor",
+        ScriptedExtractor(product_name=XSS_NAME, first_unit="قطعة"),
+    )
 
     order = analyse(client)
     order_id = order["order_id"]

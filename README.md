@@ -19,7 +19,7 @@ catalog-matched orders with mandatory, attributable human review. The system
 **narrows the catalog; it never decides.** Every line needs an explicit decision
 from a signed-in operator before approval or export.
 
-**Project artifacts:** [technical overview & pilot-readiness deck](docs/Wholesale_Order_Parser_Technical_Overview.pptx) · [GitHub readiness audit](docs/GITHUB_READINESS_AUDIT.md) · [release notes](CHANGELOG.md)
+**Release notes:** [CHANGELOG.md](CHANGELOG.md)
 
 ## Why this exists
 
@@ -72,17 +72,12 @@ receives no UUID from it. Every generated document says so in a footer, and
 otherwise. The optional `الكود الضريبي` field in shop settings is display text
 only.
 
-### Measured accuracy
+### Human-reviewed matching
 
-| Setting | Result |
-| --- | --- |
-| 50-SKU catalog, live Gemini, 20 real messages | product 93.1% · quantity 100% · unit 100% · 0 silent errors |
-| 400-SKU catalog of close variants, 192 queries | correct SKU **inside the shown top-5: 92.7%** · top-1: 48.4% |
-
-The second row drives the product design: on a hard catalog the right answer is
-in front of the reviewer ~93% of the time, even though picking it automatically
-would be wrong about half the time. That is exactly why the human decision is
-mandatory and why the shortlist — not the auto-pick — is the deliverable.
+Gemini extracts advisory product, quantity, and unit candidates. It does not
+select a commercial SKU, set a price, or approve an order. Catalog-backed
+matching and an explicit human decision remain authoritative for every line;
+the shortlist assists review and is not an automatic commercial decision.
 
 ### Review → approval
 
@@ -100,16 +95,21 @@ python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
-cp .env.example .env               # Windows: Copy-Item .env.example .env
-# edit .env: set GEMINI_API_KEY and APP_PASSWORD
+# Do not create .env inside this repository: it may be cloud-synchronised.
+# On Windows, copy the field reference to C:\ProgramData\wop\wop.env and edit
+# that machine-local file. Or set WOP_ENV_FILE to another absolute,
+# non-synchronised path. Railway uses service variables instead.
+# Configure GEMINI_API_KEY, APP_PASSWORD (or APP_USERS), and APP_SESSION_SECRET
+# in that external development environment file.
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 Open <http://localhost:8000>; you will be redirected to `/login`.
 
-If `APP_PASSWORD` and `APP_USERS` are both unset, a random password is generated
-and printed to the console at startup — the app is never accidentally open.
+For local development, configure explicit credentials before opening the app.
+If they are absent, a temporary development credential is generated but never
+printed or accepted as a production setup; do not rely on that fallback.
 
 > **Dependency note:** extraction imports `from google import genai`, which comes
 > from the **`google-genai`** package (declared in `requirements.txt`). The older
@@ -121,14 +121,12 @@ and printed to the console at startup — the app is never accidentally open.
 ```bash
 pip install -r requirements-dev.txt
 ruff check app tests serve_demo.py
-pytest --ignore=tests/test_live_gemini.py
+pytest
 pip-audit -r requirements.txt
 ```
 
-The live Gemini test is excluded because it spends real API quota.
-
-GitHub Actions repeats these gates on every push and pull request, builds the
-Docker image, and runs scheduled CodeQL analysis. Dependabot watches Python,
+GitHub Actions repeats these gates for pull requests and pushes to `main`,
+builds the Docker image, and runs scheduled CodeQL analysis. Dependabot watches Python,
 GitHub Actions, and Docker dependencies weekly.
 
 ---
@@ -149,11 +147,11 @@ The parser accepts:
 * **English or Arabic headers**: `product_id` / `sku` / `كود المنتج`,
   `product_name` / `الصنف` / `اسم المنتج`, `aliases` / `مرادفات`,
   `unit` / `الوحدة`, `price` / `السعر`.
-* Missing `aliases`, `unit`, or `price` columns, with a warning — dialect aliases
-  measurably improve matching.
+* `aliases` are optional. Product ID, product name, unit, and price are required
+  commercial fields.
 
-Duplicate codes, missing codes, and missing names are rejected with the offending
-row number.
+Duplicate codes, missing required fields, malformed prices, and invalid units
+are rejected with actionable row diagnostics.
 
 Replacing the catalog **cannot rewrite history**: approved snapshots store the
 product name, unit, and price captured at approval time.
@@ -166,19 +164,20 @@ product name, unit, and price captured at approval time.
 | --- | --- |
 | Authentication | Required on every data endpoint. The only public routes are `/login`, `/api/login`, `/api/logout`, `/api/session`, `/api/health`. `/docs`, `/redoc` and `/openapi.json` are **disabled** unless `EXPOSE_API_DOCS=true`. |
 | Reviewer identity | Taken from the **signed-in session**. A request whose `actor` disagrees with the session is rejected with `403` — never silently rewritten. |
-| Sessions | Signed cookies (`itsdangerous`), 12 h default, `SESSION_HTTPS_ONLY=true` behind TLS. |
-| Brute force | Login throttling keyed on **both** the client address and the account name, so a spoofed `X-Forwarded-For` cannot buy extra attempts. `X-Forwarded-For` is honoured only when `TRUST_PROXY_HEADERS=true`. |
+| Sessions | Signed cookies (`itsdangerous`), 12 h default, `SESSION_HTTPS_ONLY=true` behind TLS. `APP_ENV=production` refuses a generated or short session secret. |
+| Brute force | Login throttling keyed on **both** the proxy-normalised client address and the account name. Raw `X-Forwarded-For` is never read by application code; Uvicorn accepts it only from the configured trusted proxy CIDRs. |
+| Production startup | The single-merchant profile requires an explicit Gemini key, named `APP_USERS`, HTTPS-only cookies, trusted proxy CIDRs, and an `ORDERS_DB_PATH` inside `PERSISTENT_VOLUME_PATH`; unsafe production configuration stops startup. |
 | Stored XSS | Every untrusted value is HTML-escaped before it reaches the DOM. |
 | CSV injection | Cells beginning `= + - @` are prefixed so Excel treats them as text. |
 | Error responses | Generic messages to the client; details go to the server log only. |
-| CSRF | State-changing requests must carry a same-origin `Origin`/`Referer`. `SameSite=Lax` alone is not enough: "same site" ignores the port, so another port on the same host — and any sibling subdomain — is same-site, and a `multipart/form-data` POST needs no preflight. |
+| CSRF | Browser-originated state-changing requests with an `Origin` or `Referer` must be same-origin. Requests without either header are allowed for authenticated non-browser callers. `SameSite=Lax` alone is not enough: "same site" ignores the port, so another port on the same host — and any sibling subdomain — is same-site, and a `multipart/form-data` POST needs no preflight. |
 | Browser hardening | CSP, anti-framing, `nosniff`, no-referrer, restricted browser capabilities, and `no-store` on sensitive responses. |
 | Export semantics | CSV/XLSX exports are POST operations because they create immutable audit events; state-changing GET exports are rejected. |
 
 **Known limitations, stated plainly:**
 
-* **Single-tenant.** One deployment serves one merchant, one catalog, one
-  database. Do not put two customers on one instance.
+* **Instance-per-customer.** One deployment serves one merchant, one catalog,
+  and one database. Do not put two customers on one instance.
 * **No per-order authorization.** Any signed-in operator can read and act on any
   order in that deployment.
 * **Logout clears the client session but does not revoke the signed cookie**,
@@ -187,6 +186,10 @@ product name, unit, and price captured at approval time.
   writes `orders.db`, `orders.db-wal` and `orders.db-shm` as one atomic unit;
   OneDrive syncing them independently can corrupt or silently roll back data.
   Set `ORDERS_DB_PATH` to a path such as `C:\ProgramData\wop\orders.db`.
+* Do not keep a runtime `.env` in this repository or any synced folder. The app
+  only loads an explicit `WOP_ENV_FILE` (or `C:\ProgramData\wop\wop.env` on
+  Windows); Railway uses service variables. Each deployment needs distinct
+  `APP_USERS` passwords and a distinct `APP_SESSION_SECRET`.
 
 ---
 
@@ -270,9 +273,11 @@ The UI reports **measured** time only:
 
 ## Deployment
 
-See [DEPLOY.md](DEPLOY.md). `Dockerfile`, `Procfile`, `railway.json`, and
-`fly.toml` are included. Set `ORDERS_DB_PATH` to a mounted volume so the SQLite
-database survives redeploys.
+For the first real deployment, follow
+[docs/pilot/RAILWAY_SINGLE_MERCHANT_DEPLOYMENT.md](docs/pilot/RAILWAY_SINGLE_MERCHANT_DEPLOYMENT.md)
+exactly. It requires one Railway service, one replica, one mounted `/app/data`
+volume, and one SQLite database. [DEPLOY.md](DEPLOY.md) is a concise entry point
+to that supported Railway-only topology.
 
 ---
 
@@ -302,4 +307,5 @@ events to make a row exportable.
 ## License
 
 Released under the [MIT License](LICENSE). You may use, modify, and distribute
-the software with attribution; it is provided without warranty.
+the software under its terms, including retention of the copyright and
+permission notice; it is provided without warranty.
