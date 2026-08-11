@@ -19,7 +19,7 @@ rapidfuzz>=3.9.0
 google-genai>=1.0.0
 
 # Config
-python-dotenv>=1.0.0
+python-dotenv>=1.2.2
 
 # Catalog upload: .xlsx support (merchants send Excel files)
 openpyxl>=3.1.0
